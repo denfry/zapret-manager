@@ -68,7 +68,13 @@ func (a *App) applyStrategy(relDir, name string) error {
 	if err := installZapretService(cmdline, s.Name); err != nil {
 		return err
 	}
-	if err := startService(zapretSvcName, 15*time.Second); err != nil {
+	err = startService(zapretSvcName, 15*time.Second)
+	if err != nil {
+		// драйвер WinDivert мог ещё выгружаться — одна повторная попытка
+		time.Sleep(3 * time.Second)
+		err = startService(zapretSvcName, 15*time.Second)
+	}
+	if err != nil {
 		// служба не говорит, что не так, — запустим ту же строку руками и покажем вывод winws
 		if p, perr := startWinws(cmdline, filepath.Join(relDir, "bin"), 3*time.Second); perr != nil {
 			err = fmt.Errorf("%v; %v", err, perr)

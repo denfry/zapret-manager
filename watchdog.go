@@ -83,9 +83,13 @@ func (a *App) watchdog(ctx context.Context, wake <-chan string) {
 	if nextUpdate.Before(now.Add(2 * time.Minute)) {
 		nextUpdate = now.Add(2 * time.Minute)
 	}
+	nextAlive := now.Add(30 * time.Second)
 	for {
 		wait := time.Until(nextCheck)
 		if u := time.Until(nextUpdate); u < wait {
+			wait = u
+		}
+		if u := time.Until(nextAlive); u < wait {
 			wait = u
 		}
 		if wait < time.Second {
@@ -108,7 +112,12 @@ func (a *App) watchdog(ctx context.Context, wake <-chan string) {
 
 		if a.handlePause(now) {
 			nextCheck = now.Add(time.Minute)
+			nextAlive = now.Add(30 * time.Second)
 			continue
+		}
+		if !now.Before(nextAlive) {
+			nextAlive = now.Add(30 * time.Second)
+			a.ensureRunning()
 		}
 		if !now.Before(nextUpdate) {
 			err := a.withLock(0, func() error {
@@ -146,6 +155,29 @@ func (a *App) handlePause(now time.Time) bool {
 		a.Log.Warnf("zapret: %v", err)
 	}
 	return false
+}
+
+// ensureRunning — дешёвая проверка раз в 30 с: служба zapret должна работать.
+// Во время подбора блокировка занята, и сюда не попадаем.
+func (a *App) ensureRunning() {
+	info := queryService(zapretSvcName)
+	if !info.Exists || info.State == svc.Running || info.State == svc.StartPending {
+		return
+	}
+	_ = a.withLock(0, func() error {
+		info := queryService(zapretSvcName)
+		if !info.Exists || info.State == svc.Running {
+			return nil
+		}
+		a.Log.Eventf("служба zapret была %s — запускаю", stateName(info.State))
+		if info.StartType == mgr.StartDisabled {
+			_ = setServiceStartType(zapretSvcName, mgr.StartAutomatic)
+		}
+		if err := startService(zapretSvcName, 15*time.Second); err != nil {
+			a.Log.Warnf("zapret: %v", err)
+		}
+		return nil
+	})
 }
 
 // periodicCheck проверяет Discord/YouTube и при подтверждённой поломке лечит.

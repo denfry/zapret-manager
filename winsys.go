@@ -275,12 +275,9 @@ func installZapretService(cmdline, strategyName string) error {
 	if err := changeService(s, mgr.StartAutomatic, cmdline, "zapret", "Zapret DPI bypass software (управляется zapret-manager)"); err != nil {
 		return fmt.Errorf("не обновить службу zapret: %w", err)
 	}
-	_ = s.SetRecoveryActions([]mgr.RecoveryAction{
-		{Type: mgr.ServiceRestart, Delay: 5 * time.Second},
-		{Type: mgr.ServiceRestart, Delay: 15 * time.Second},
-		{Type: mgr.ServiceRestart, Delay: 60 * time.Second},
-	}, 3600)
-	_ = s.SetRecoveryActionsOnNonCrashFailures(true)
+	// Без автоперезапуска от SCM: иначе он поднимет zapret посреди подбора, когда мы его
+	// остановили. Упавшую службу через ≤30 с поднимет сторож.
+	_ = s.ResetRecoveryActions()
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Services\`+zapretSvcName, registry.SET_VALUE)
 	if err == nil {
 		_ = k.SetStringValue(strategyRegValue, strategyName)
@@ -345,6 +342,7 @@ func removeWinDivert() {
 		return
 	}
 	defer m.Disconnect()
+	var touched []string
 	for _, name := range []string{"WinDivert", "WinDivert14"} {
 		s, err := m.OpenService(name)
 		if err != nil {
@@ -353,6 +351,15 @@ func removeWinDivert() {
 		_, _ = s.Control(svc.Stop)
 		_ = s.Delete()
 		s.Close()
+		touched = append(touched, name)
+	}
+	// пока драйвер выгружается, служба «помечена на удаление», и новый winws не стартует
+	// (ERROR_SERVICE_MARKED_FOR_DELETE) — ждём, пока она исчезнет
+	deadline := time.Now().Add(10 * time.Second)
+	for _, name := range touched {
+		for queryService(name).Exists && time.Now().Before(deadline) {
+			time.Sleep(300 * time.Millisecond)
+		}
 	}
 }
 
