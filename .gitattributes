@@ -1,0 +1,9 @@
+# gofmt требует LF. Без этого на Windows (core.autocrlf=true, в том числе на раннерах
+# GitHub Actions) checkout даёт CRLF, и проверка gofmt падает на каждом файле.
+* text=auto eol=lf
+*.go text eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+# Корпус fuzz-тестов — точные байты.
+**/testdata/** -text

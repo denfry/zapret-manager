@@ -4,13 +4,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/sys/windows"
+
+	"zapret-manager/internal/batch"
+	"zapret-manager/internal/textutil"
 )
 
 // Config — настройки менеджера (config.json в корневой папке). Настройки самого
@@ -52,8 +57,20 @@ func defaultConfig() Config {
 	}
 }
 
-func (c *Config) normalize() {
+// repo и branch подставляются в URL GitHub — только безопасные символы.
+var (
+	repoRe   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$`)
+	branchRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$`)
+)
+
+// maxTargets ограничивает число адресов: каждая проверка — отдельное соединение.
+const maxTargets = 50
+
+// normalize подставляет значения по умолчанию вместо недопустимых и возвращает
+// предупреждения о том, что пришлось исправить.
+func (c *Config) normalize() []string {
 	d := defaultConfig()
+	var warns []string
 	if c.CheckIntervalSec < 60 {
 		c.CheckIntervalSec = d.CheckIntervalSec
 	}
@@ -72,12 +89,42 @@ func (c *Config) normalize() {
 	if c.KeepVersions < 1 {
 		c.KeepVersions = d.KeepVersions
 	}
-	if strings.TrimSpace(c.Repo) == "" {
+	c.Repo, c.Branch = strings.TrimSpace(c.Repo), strings.TrimSpace(c.Branch)
+	if c.Repo == "" {
+		c.Repo = d.Repo
+	} else if !repoRe.MatchString(c.Repo) || strings.Contains(c.Repo, "..") {
+		warns = append(warns, fmt.Sprintf("repo %q не похож на «владелец/репозиторий» — беру %s", c.Repo, d.Repo))
 		c.Repo = d.Repo
 	}
-	if strings.TrimSpace(c.Branch) == "" {
+	if c.Branch == "" {
+		c.Branch = d.Branch
+	} else if !branchRe.MatchString(c.Branch) || strings.Contains(c.Branch, "..") {
+		warns = append(warns, fmt.Sprintf("branch %q недопустима — беру %s", c.Branch, d.Branch))
 		c.Branch = d.Branch
 	}
+	var targets []Target
+	for _, t := range c.Targets {
+		u, err := url.Parse(strings.TrimSpace(t.URL))
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
+			warns = append(warns, fmt.Sprintf("адрес проверки %q пропущен: нужен http(s)://хост/…", t.URL))
+			continue
+		}
+		t.URL = u.String()
+		t.Group = strings.ToLower(strings.TrimSpace(t.Group))
+		if t.Group == "" {
+			t.Group = "other"
+		}
+		if strings.TrimSpace(t.Name) == "" {
+			t.Name = u.Host
+		}
+		targets = append(targets, t)
+	}
+	if len(targets) > maxTargets {
+		warns = append(warns, fmt.Sprintf("адресов проверки %d, беру первые %d", len(targets), maxTargets))
+		targets = targets[:maxTargets]
+	}
+	c.Targets = targets
+	return warns
 }
 
 // State — что менеджер помнит между запусками (state.json).
@@ -118,12 +165,18 @@ type SweepSummary struct {
 	Ranking []RankEntry `json:"ranking"`
 }
 
+// App — корневая папка, конфиг и лог одного процесса (консольной команды или службы).
+// Методы App вызываются из одной горутины, кроме Log и updateState (они под мьютексами).
 type App struct {
-	Root    string
-	Cfg     Config
-	Log     *Logger
-	stateMu sync.Mutex
+	Root       string
+	Cfg        Config
+	Log        *Logger
+	downloader *downloader // nil — общий defaultDownloader; тесты подставляют свой
+	rawBase    string      // "" — https://raw.githubusercontent.com (тесты подставляют свой сервер)
+	githubBase string      // "" — https://github.com
+	stateMu    sync.Mutex
 
+	cfgWarns      string    // последние предупреждения конфига — чтобы не повторять их каждые 5 минут
 	lastStartFail time.Time // чтобы ensureRunning не долбил SCM каждые 30 с, если служба не стартует
 }
 
@@ -155,7 +208,7 @@ func resolveRoot(dirFlag string) string {
 		}
 	}
 	if info := queryService(managerSvcName); info.Exists && info.BinPath != "" {
-		if exe := exeFromCmdline(info.BinPath); exe != "" {
+		if exe := batch.ExeFromCmdline(info.BinPath); exe != "" {
 			return filepath.Dir(exe)
 		}
 	}
@@ -171,13 +224,20 @@ func (a *App) customDir() string   { return a.path("custom") }
 
 func (a *App) reloadConfig() {
 	cfg := defaultConfig()
+	var warns []string
 	if data, err := os.ReadFile(a.path("config.json")); err == nil {
-		if err := json.Unmarshal(stripBOM(data), &cfg); err != nil {
-			a.Log.Warnf("config.json не читается (%v) — беру настройки по умолчанию", err)
+		if err := json.Unmarshal(textutil.StripBOM(data), &cfg); err != nil {
+			warns = append(warns, fmt.Sprintf("config.json не читается (%v) — беру настройки по умолчанию", err))
 			cfg = defaultConfig()
 		}
 	}
-	cfg.normalize()
+	warns = append(warns, cfg.normalize()...)
+	if joined := strings.Join(warns, "\n"); joined != a.cfgWarns {
+		a.cfgWarns = joined
+		for _, w := range warns {
+			a.Log.Warnf("config.json: %s", w)
+		}
+	}
 	a.Cfg = cfg
 }
 
@@ -186,27 +246,67 @@ func (a *App) saveConfigIfMissing() error {
 	if fileExists(p) {
 		return nil
 	}
-	data, _ := json.MarshalIndent(defaultConfig(), "", "  ")
+	data, err := json.MarshalIndent(defaultConfig(), "", "  ")
+	if err != nil {
+		return err
+	}
 	return writeFileAtomic(p, data)
 }
 
-func (a *App) loadState() State {
+// readState читает state.json. Отсутствующий файл — пустое состояние без ошибки.
+func (a *App) readState() (State, error) {
 	var st State
-	if data, err := os.ReadFile(a.path("state.json")); err == nil {
-		_ = json.Unmarshal(stripBOM(data), &st)
+	data, err := os.ReadFile(a.path("state.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return st, nil
 	}
+	if err != nil {
+		return st, err
+	}
+	if err := json.Unmarshal(textutil.StripBOM(data), &st); err != nil {
+		return State{}, err
+	}
+	return st, nil
+}
+
+// loadState — состояние для чтения; при ошибке пустое (status и проверки не должны падать).
+func (a *App) loadState() State {
+	st, _ := a.readState()
 	return st
 }
 
-// updateState перечитывает state.json, применяет fn и сохраняет. Между процессами
-// (служба и консольная команда) возможна гонка, но обе пишут под общей блокировкой.
+// stateLockTimeout — сколько ждать, пока другой процесс допишет state.json.
+const stateLockTimeout = 10 * time.Second
+
+// updateState перечитывает state.json, применяет fn и сохраняет. Служба и консольные
+// команды — разные процессы, поэтому чтение-изменение-запись идёт под отдельной
+// файловой блокировкой .state.lock (общую .lock надолго занимает подбор).
+// fn не должна вызывать updateState.
 func (a *App) updateState(fn func(*State)) {
 	a.stateMu.Lock()
 	defer a.stateMu.Unlock()
-	st := a.loadState()
+	release, err := acquireFileLock(a.path(".state.lock"), stateLockTimeout, nil)
+	if err != nil {
+		// без прав администратора папка только для чтения — это нормально для status/check
+		a.Log.Debugf("state.json не сохранён: %v", err)
+		return
+	}
+	defer release()
+	st, err := a.readState()
+	if err != nil {
+		// испорченный файл не затираем молча: откладываем копию для разбора
+		bad := a.path(fmt.Sprintf("state.json.corrupt-%s", time.Now().Format("20060102-150405")))
+		if rerr := os.Rename(a.path("state.json"), bad); rerr != nil {
+			a.Log.Warnf("state.json не читается (%v) и не переименовать (%v) — состояние не сохранено", err, rerr)
+			return
+		}
+		a.Log.Warnf("state.json не читается (%v) — отложен в %s, начинаю с чистого состояния", err, filepath.Base(bad))
+		st = State{}
+	}
 	fn(&st)
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
+		a.Log.Warnf("state.json не сохранён: %v", err)
 		return
 	}
 	if err := writeFileAtomic(a.path("state.json"), data); err != nil {
@@ -216,41 +316,61 @@ func (a *App) updateState(fn func(*State)) {
 
 var errBusy = errors.New("сейчас идёт другая операция (подбор или обновление) — попробуйте через пару минут")
 
-// withLock — общая блокировка между службой и консольными командами: файл .lock,
-// открытый без общего доступа. Держит процесс; при падении процесса снимается сам.
+const lockPollInterval = 500 * time.Millisecond
+
+// acquireFileLock — межпроцессная блокировка: файл, открытый без общего доступа.
+// Держит процесс; при его падении Windows закрывает дескриптор и блокировка снимается.
+// timeout 0 — одна попытка. onWait вызывается один раз, если пришлось ждать.
+func acquireFileLock(p string, timeout time.Duration, onWait func()) (release func(), err error) {
+	name, err := windows.UTF16PtrFromString(p)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(timeout)
+	waited := false
+	for {
+		h, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil,
+			windows.OPEN_ALWAYS, windows.FILE_ATTRIBUTE_NORMAL, 0)
+		if err == nil {
+			return func() { _ = windows.CloseHandle(h) }, nil
+		}
+		if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+			return nil, fmt.Errorf("блокировка %s: %w", p, err)
+		}
+		if !time.Now().Before(deadline) {
+			return nil, errBusy
+		}
+		if !waited && onWait != nil {
+			onWait()
+			waited = true
+		}
+		time.Sleep(lockPollInterval)
+	}
+}
+
+// withLock — общая блокировка долгих операций (подбор, обновление, смена стратегии)
+// между службой и консольными командами.
 func (a *App) withLock(timeout time.Duration, fn func() error) error {
 	if err := os.MkdirAll(a.Root, 0o755); err != nil {
 		return err
 	}
-	p, err := windows.UTF16PtrFromString(a.path(".lock"))
+	release, err := acquireFileLock(a.path(".lock"), timeout, func() {
+		if timeout > 5*time.Second {
+			a.Log.Infof("жду, пока служба закончит текущую операцию…")
+		}
+	})
 	if err != nil {
 		return err
 	}
-	deadline := time.Now().Add(timeout)
-	announced := false
-	for {
-		h, err := windows.CreateFile(p, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil,
-			windows.OPEN_ALWAYS, windows.FILE_ATTRIBUTE_NORMAL, 0)
-		if err == nil {
-			defer windows.CloseHandle(h)
-			return fn()
-		}
-		if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
-			return fmt.Errorf("блокировка %s: %w", a.path(".lock"), err)
-		}
-		if time.Now().After(deadline) {
-			return errBusy
-		}
-		if !announced && timeout > 5*time.Second {
-			a.Log.Infof("жду, пока служба закончит текущую операцию…")
-			announced = true
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
+	defer release()
+	return fn()
 }
 
 // ---------- лог ----------
 
+// Logger пишет в logs\manager.log (общий для службы и консоли) и, если console,
+// дублирует Info/Event/Warn на экран. Файл открывается на каждую запись: так
+// ротация и запись из двух процессов не держат дескриптор.
 type Logger struct {
 	mu      sync.Mutex
 	path    string
@@ -262,23 +382,25 @@ const (
 	lvlEvent = "[*]"
 	lvlWarn  = "[!]"
 	lvlDebug = "[.]"
+
+	logTimeLayout = "2006-01-02 15:04:05"
+	maxLogBytes   = 2 << 20
 )
 
 func (l *Logger) write(level, msg string, toConsole bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.console && toConsole {
-		switch level {
-		case lvlWarn:
+		if level == lvlWarn {
 			fmt.Println("! " + msg)
-		default:
+		} else {
 			fmt.Println(msg)
 		}
 	}
 	if l.path == "" {
 		return
 	}
-	if fi, err := os.Stat(l.path); err == nil && fi.Size() > 2<<20 {
+	if fi, err := os.Stat(l.path); err == nil && fi.Size() > maxLogBytes {
 		_ = os.Remove(l.path + ".1")
 		_ = os.Rename(l.path, l.path+".1")
 	}
@@ -286,16 +408,35 @@ func (l *Logger) write(level, msg string, toConsole bool) {
 	if err != nil {
 		return
 	}
-	defer f.Close()
-	for _, line := range strings.Split(strings.TrimRight(msg, "\r\n"), "\n") {
-		fmt.Fprintf(f, "%s %s %s\r\n", time.Now().Format("2006-01-02 15:04:05"), level, strings.TrimRight(line, "\r"))
+	defer f.Close() //nolint:errcheck // best-effort log
+	ts := time.Now().Format(logTimeLayout)
+	var b strings.Builder
+	for line := range strings.SplitSeq(strings.TrimRight(msg, "\r\n"), "\n") {
+		b.WriteString(ts + " " + level + " " + strings.TrimRight(line, "\r") + "\r\n")
 	}
+	_, _ = f.WriteString(b.String())
 }
 
 func (l *Logger) Infof(format string, a ...any)  { l.write(lvlInfo, fmt.Sprintf(format, a...), true) }
 func (l *Logger) Eventf(format string, a ...any) { l.write(lvlEvent, fmt.Sprintf(format, a...), true) }
 func (l *Logger) Warnf(format string, a ...any)  { l.write(lvlWarn, fmt.Sprintf(format, a...), true) }
 func (l *Logger) Debugf(format string, a ...any) { l.write(lvlDebug, fmt.Sprintf(format, a...), false) }
+
+// parseEventLine разбирает строку лога уровня Event: «2006-01-02 15:04:05 [*] текст».
+// Уровень ищется строго после метки времени, чтобы «[*]» внутри текста другой
+// строки (например, из ответа сервера) не выдавал её за событие.
+func parseEventLine(l string) (time.Time, string, bool) {
+	prefix := len(logTimeLayout)
+	marker := " " + lvlEvent + " "
+	if len(l) < prefix+len(marker) || l[prefix:prefix+len(marker)] != marker {
+		return time.Time{}, "", false
+	}
+	ts, err := time.ParseInLocation(logTimeLayout, l[:prefix], time.Local)
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	return ts, l[prefix+len(marker):], true
+}
 
 // ---------- файлы ----------
 
@@ -309,24 +450,32 @@ func dirExists(p string) bool {
 	return err == nil && fi.IsDir()
 }
 
-func stripBOM(b []byte) []byte {
-	if len(b) >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF {
-		return b[3:]
-	}
-	return b
-}
-
+// writeFileAtomic пишет во временный файл рядом (уникальное имя — два процесса не
+// мешают друг другу), сбрасывает на диск и переименовывает поверх.
 func writeFileAtomic(p string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	f, err := os.CreateTemp(dir, filepath.Base(p)+".*.tmp")
+	if err != nil {
 		return err
+	}
+	tmp := f.Name()
+	_, werr := f.Write(data)
+	if werr == nil {
+		werr = f.Sync()
+	}
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		_ = os.Remove(tmp)
+		return werr
 	}
 	if err := os.Rename(tmp, p); err != nil {
 		_ = os.Remove(tmp)
-		// файл может быть занят (winws держит открытым) — пишем поверх
+		// файл может быть занят (winws держит списки открытыми) — пишем поверх
 		return os.WriteFile(p, data, 0o644)
 	}
 	return nil
@@ -356,6 +505,9 @@ func copyDir(src, dst string) error {
 		if fi.IsDir() {
 			return os.MkdirAll(target, 0o755)
 		}
+		if !fi.Mode().IsRegular() {
+			return nil // ссылки и устройства не копируем
+		}
 		return copyFile(p, target)
 	})
 }
@@ -366,19 +518,10 @@ func samePath(a, b string) bool {
 	return strings.EqualFold(filepath.Clean(ca), filepath.Clean(cb))
 }
 
-// normalizeText приводит текст к LF без хвостовых пробелов строк — для сравнения списков.
-func normalizeText(s string) string {
-	s = strings.TrimPrefix(s, "\uFEFF")
-	s = strings.ReplaceAll(s, "\r\n", "\n")
-	lines := strings.Split(s, "\n")
-	for i, l := range lines {
-		lines[i] = strings.TrimRight(l, " \t\r")
-	}
-	return strings.TrimRight(strings.Join(lines, "\n"), "\n")
-}
-
-func toCRLF(s string) string {
-	s = strings.ReplaceAll(s, "\r\n", "\n")
-	s = strings.TrimRight(s, "\n")
-	return strings.ReplaceAll(s, "\n", "\r\n") + "\r\n"
+// isWithin: p лежит внутри dir или совпадает с ней (без учёта регистра).
+func isWithin(p, dir string) bool {
+	cp, _ := filepath.Abs(p)
+	cd, _ := filepath.Abs(dir)
+	cp, cd = strings.ToLower(filepath.Clean(cp)), strings.ToLower(filepath.Clean(cd))
+	return cp == cd || strings.HasPrefix(cp, strings.TrimRight(cd, `\`)+`\`)
 }

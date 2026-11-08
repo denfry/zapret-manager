@@ -1,0 +1,71 @@
+# golangci-lint v2. Запуск: golangci-lint run ./...
+# Набор подобран под ошибки, а не под стиль: wsl/varnamelen/nlreturn и т.п. не включены.
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose
+    - copyloopvar
+    - durationcheck
+    - errchkjson
+    - errorlint
+    - gocritic
+    - gosec
+    - intrange
+    - modernize
+    - nilerr
+    - noctx
+    - predeclared
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+  settings:
+    errcheck:
+      # Закрытие дескрипторов только для чтения и хэндлов SCM/реестра/процессов:
+      # ошибка закрытия ничего не меняет и не может быть обработана осмысленно.
+      # Закрытие файлов, в которые пишем, проверяется явно (см. writeFileAtomic, safezip).
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - golang.org/x/sys/windows.CloseHandle
+        - golang.org/x/sys/windows.CloseServiceHandle
+        - (*golang.org/x/sys/windows/svc/mgr.Mgr).Disconnect
+        - (*golang.org/x/sys/windows/svc/mgr.Service).Close
+        - (golang.org/x/sys/windows/registry.Key).Close
+    gosec:
+      excludes:
+        # Unix-биты прав (0644/0755) на Windows не действуют. Доступ к корневой папке
+        # задаётся ACL в security.go (secureTree) и проверяется в doctor.
+        - G301
+        - G302
+        - G306
+        # Пути строятся от корневой папки, которую задаёт администратор (--dir), и от
+        # имён внутри неё; недоверенные пути из архива проверяет internal/safezip.
+        - G304
+        - G703
+        # Запуск winws.exe из папки релиза — назначение программы; netsh — по
+        # абсолютному пути из System32 (systemBinary).
+        - G204
+        - G702
+        # URL строятся из repo/branch, проверенных в Config.normalize (repoRe/branchRe).
+        - G704
+        # unsafe нужен для структур Win32 (ACE, Job Object, перечисление служб).
+        - G103
+        # Дублирует errcheck.
+        - G104
+    gocritic:
+      disabled-checks:
+        - ifElseChain # цепочки if/else в разборе состояний читаются лучше switch
+        - singleCaseSwitch
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

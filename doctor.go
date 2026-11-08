@@ -9,7 +9,32 @@ import (
 
 	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc"
+
+	"zapret-manager/internal/hostsfile"
 )
+
+var cyrillicRe = regexp.MustCompile(`[А-Яа-яЁё]`)
+
+// uniquePaths — пути без повторов (сравнение без учёта регистра), пустые пропускаются.
+func uniquePaths(paths ...string) []string {
+	var out []string
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		dup := false
+		for _, o := range out {
+			if samePath(o, p) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 // runDoctor — то же, что «Run Diagnostics» в service.bat, плюс VPN-туннели и прокси.
 func (a *App) runDoctor() int {
@@ -24,12 +49,28 @@ func (a *App) runDoctor() int {
 		problems++
 	} else {
 		ok(fmt.Sprintf("zapret %s, стратегия %s, папка %s", releaseVersion(relDir), strategy, relDir))
-		if regexp.MustCompile(`[А-Яа-яЁё]`).MatchString(relDir) {
+		if cyrillicRe.MatchString(relDir) {
 			warn("в пути к zapret кириллица — winws может не найти файлы")
 		}
 		if od := os.Getenv("OneDrive"); od != "" && strings.HasPrefix(strings.ToLower(relDir), strings.ToLower(od)) {
 			bad("zapret лежит в OneDrive — перенесите (zapret-manager install кладёт в C:\\zapret)")
 			problems++
+		}
+		// winws.exe и стратегии исполняются от SYSTEM: писать в их папку должен только администратор
+		for _, dir := range uniquePaths(a.Root, relDir) {
+			if !dirExists(dir) {
+				continue
+			}
+			switch rep, err := checkDirACL(dir); {
+			case err != nil:
+				warn("права на " + dir + " не прочитать: " + err.Error())
+			case !rep.ok():
+				bad(fmt.Sprintf("папку %s может менять не только администратор (%s) — это путь к правам SYSTEM; "+
+					"zapret-manager install или перезапуск службы-сторожа исправит права на свою папку", dir, rep))
+				problems++
+			default:
+				ok("права на " + dir + " — запись только у администраторов")
+			}
 		}
 	}
 
@@ -133,15 +174,19 @@ func (a *App) runDoctor() int {
 		warn("DNS-over-HTTPS в Windows не настроен — провайдер может подменять DNS (Параметры → Сеть → DNS → Шифрование)")
 	}
 
-	enableTCPTimestamps()
-	ok("TCP timestamps включены (нужны стратегиям с fooling=ts)")
+	if err := enableTCPTimestamps(); err != nil {
+		bad("TCP timestamps не включить: " + err.Error())
+		problems++
+	} else {
+		ok("TCP timestamps включены (нужны стратегиям с fooling=ts)")
+	}
 
 	if data, err := os.ReadFile(hostsPath()); err == nil {
 		text := strings.ToLower(string(data))
 		if strings.Contains(text, "youtube.com") || strings.Contains(text, "youtu.be") {
 			warn("в hosts есть записи youtube.com/youtu.be — они ломают YouTube")
 		}
-		if strings.Contains(string(data), hostsBegin) {
+		if strings.Contains(string(data), hostsfile.Begin) {
 			ok("блок Flowseal в hosts на месте")
 		}
 	}

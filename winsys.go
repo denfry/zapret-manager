@@ -2,10 +2,13 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -16,6 +19,8 @@ import (
 	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
+
+	"zapret-manager/internal/batch"
 )
 
 // ---------- службы ----------
@@ -86,7 +91,7 @@ func serviceFromRegistry(name string) (bin string, start uint32, ok bool) {
 	if err != nil {
 		return "", 0, false
 	}
-	if v, _, err := k.GetIntegerValue("Start"); err == nil {
+	if v, _, err := k.GetIntegerValue("Start"); err == nil && v <= math.MaxUint32 {
 		start = uint32(v)
 	}
 	return bin, start, true
@@ -175,9 +180,13 @@ func stopService(name string, timeout time.Duration) error {
 	return fmt.Errorf("служба %s не остановилась за %s", name, timeout)
 }
 
+// startTimeout — сколько ждать перехода службы в RUNNING.
+const startTimeout = 15 * time.Second
+
 // startService запускает службу и ждёт, пока она реально заработает (winws с кривыми
 // аргументами падает сразу — это тоже ловим).
-func startService(name string, timeout time.Duration) error {
+func startService(name string) error {
+	timeout := startTimeout
 	m, err := connectSCM()
 	if err != nil {
 		return err
@@ -214,7 +223,7 @@ func startService(name string, timeout time.Duration) error {
 	return fmt.Errorf("служба %s не запустилась за %s", name, timeout)
 }
 
-func setServiceStartType(name string, startType uint32) error {
+func setServiceStartType(name string, startType uint32) error { //nolint:unparam // generic SCM helper like start/stopService
 	m, err := connectSCM()
 	if err != nil {
 		return err
@@ -425,7 +434,7 @@ func killPID(pid uint32) error {
 	return nil
 }
 
-func killProcesses(exeName string) int {
+func killProcesses(exeName string) int { //nolint:unparam // mirrors processPIDs(exeName)
 	n := 0
 	for _, pid := range processPIDs(exeName) {
 		if killPID(pid) == nil {
@@ -452,12 +461,13 @@ func (p *winwsProc) output() string {
 }
 
 func startWinws(cmdline, workDir string, readyTimeout time.Duration) (*winwsProc, error) {
-	exe := exeFromCmdline(cmdline)
+	exe := batch.ExeFromCmdline(cmdline)
 	r, w, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.Command(exe)
+	// Без CommandContext: временем жизни процесса управляют Stop и Job Object.
+	cmd := exec.Command(exe) //nolint:noctx // lifetime is managed by Stop and the job object
 	cmd.Dir = workDir
 	cmd.Stdout = w
 	cmd.Stderr = w
@@ -478,7 +488,8 @@ func startWinws(cmdline, workDir string, readyTimeout time.Duration) (*winwsProc
 		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 		if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation,
 			uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err == nil {
-			if ph, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid)); err == nil {
+			pid := uint32(cmd.Process.Pid) // #nosec G115 -- Windows PIDs are DWORDs
+			if ph, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, pid); err == nil {
 				_ = windows.AssignProcessToJobObject(job, ph)
 				windows.CloseHandle(ph)
 			}
@@ -547,16 +558,39 @@ func (p *winwsProc) Stop() {
 
 // ---------- прочее системное ----------
 
+// systemBinary — полный путь к программе из System32. Поиск по PATH от имени
+// администратора или SYSTEM опасен: в PATH бывают папки, куда может писать
+// обычный пользователь (подмена netsh.exe — CWE-427).
+func systemBinary(name string) (string, error) {
+	sys, err := windows.GetSystemDirectory()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(sys, name), nil
+}
+
+const runHiddenTimeout = 30 * time.Second
+
 func runHidden(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), runHiddenTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 
 // enableTCPTimestamps — стратегии с --dpi-desync-fooling=ts без этого не работают (tcp_enable в service.bat).
-func enableTCPTimestamps() {
-	_, _ = runHidden("netsh", "interface", "tcp", "set", "global", "timestamps=enabled")
+func enableTCPTimestamps() error {
+	netsh, err := systemBinary("netsh.exe")
+	if err != nil {
+		return err
+	}
+	out, err := runHidden(netsh, "interface", "tcp", "set", "global", "timestamps=enabled")
+	if err != nil {
+		return fmt.Errorf("netsh: %w: %s", err, strings.TrimSpace(out))
+	}
+	return nil
 }
 
 func flushDNS() {

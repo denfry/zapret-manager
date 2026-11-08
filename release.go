@@ -1,146 +1,254 @@
 package main
 
 import (
-	"archive/zip"
+	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
-	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
+
+	"zapret-manager/internal/safezip"
+	"zapret-manager/internal/textutil"
+	"zapret-manager/internal/version"
+	"zapret-manager/internal/zapretfmt"
 )
 
 // ---------- HTTP для скачивания ----------
 
-var dlClient = &http.Client{
-	Timeout: 3 * time.Minute,
-	Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 15 * time.Second}).DialContext,
-		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-		ForceAttemptHTTP2:     true,
-	},
+// Лимиты на то, что приходит из репозитория.
+const (
+	maxReleaseZip  = 100 << 20 // релиз весит несколько МБ
+	maxIpsetBytes  = 32 << 20
+	maxListBytes   = 4 << 20
+	maxHostsBytes  = 1 << 20
+	maxVersionText = 256
+	maxRedirects   = 10
+)
+
+var errTooLarge = errors.New("ответ больше лимита")
+
+// httpStatusError — ответ не 200.
+type httpStatusError struct {
+	URL  string
+	Code int
 }
 
-func httpGet(ctx context.Context, url string, limit int64) ([]byte, error) {
+func (e *httpStatusError) Error() string { return fmt.Sprintf("%s: HTTP %d", e.URL, e.Code) }
+
+// downloader скачивает файлы из GitHub с ограниченными повторами. Повторяются только
+// временные ошибки (сеть, 408, 425, 429, 5xx); 404 и прочие 4xx — сразу ошибка.
+type downloader struct {
+	client   *http.Client
+	attempts int
+	backoff  time.Duration // первая пауза; дальше ×2 плюс случайная добавка до backoff/2
+}
+
+func newDownloader() *downloader {
+	return &downloader{
+		client: &http.Client{
+			Timeout: 3 * time.Minute, // на весь запрос вместе с телом
+			Transport: &http.Transport{
+				Proxy:                 http.ProxyFromEnvironment,
+				DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+				TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+				TLSHandshakeTimeout:   15 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+				IdleConnTimeout:       90 * time.Second,
+				MaxIdleConns:          4,
+				ForceAttemptHTTP2:     true,
+			},
+			CheckRedirect: httpsOnlyRedirect,
+		},
+		attempts: 3,
+		backoff:  2 * time.Second,
+	}
+}
+
+// defaultDownloader общий для процесса: один пул соединений на все запросы.
+var defaultDownloader = newDownloader()
+
+// httpsOnlyRedirect не даёт GitHub-редиректу увести запрос на http:// и ограничивает цепочку.
+func httpsOnlyRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("больше %d редиректов", maxRedirects)
+	}
+	if req.URL.Scheme != "https" {
+		return fmt.Errorf("редирект на небезопасный адрес %s отклонён", req.URL.Redacted())
+	}
+	return nil
+}
+
+func retryable(err error) bool {
+	if se, ok := errors.AsType[*httpStatusError](err); ok {
+		return se.Code == http.StatusRequestTimeout || se.Code == http.StatusTooEarly ||
+			se.Code == http.StatusTooManyRequests || se.Code >= 500
+	}
+	return !errors.Is(err, errTooLarge)
+}
+
+func (d *downloader) delay(attempt int) time.Duration {
+	if d.backoff <= 0 {
+		return 0
+	}
+	base := d.backoff << (attempt - 1)
+	return base + rand.N(d.backoff/2+1) // #nosec G404 -- retry jitter, not security-relevant
+}
+
+// fetch выполняет GET и отдаёт тело в sink (не больше limit байт). sink вызывается
+// заново на каждой попытке и должен начинать с чистого листа.
+func (d *downloader) fetch(ctx context.Context, url string, limit int64, sink func(io.Reader) error) error {
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := range d.attempts {
 		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt*3) * time.Second):
+			if err := sleepCtx(ctx, d.delay(attempt)); err != nil {
+				return err
 			}
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return nil, err
+		err := d.fetchOnce(ctx, url, limit, sink)
+		if err == nil {
+			return nil
 		}
-		req.Header.Set("User-Agent", "zapret-manager/"+appVersion)
-		req.Header.Set("Cache-Control", "no-cache")
-		resp, err := dlClient.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
+		lastErr = err
+		if ctx.Err() != nil || !retryable(err) {
+			return err
 		}
-		data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusNotFound {
-			return nil, fmt.Errorf("%s: 404", url)
-		}
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("%s: HTTP %d", url, resp.StatusCode)
-			continue
-		}
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if int64(len(data)) > limit {
-			return nil, fmt.Errorf("%s: ответ больше %d байт", url, limit)
-		}
-		return data, nil
 	}
-	return nil, lastErr
+	return lastErr
 }
 
+func (d *downloader) fetchOnce(ctx context.Context, url string, limit int64, sink func(io.Reader) error) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "zapret-manager/"+appVersion)
+	req.Header.Set("Cache-Control", "no-cache")
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close() //nolint:errcheck // read-only body
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10)) // дать соединению вернуться в пул
+		return &httpStatusError{URL: url, Code: resp.StatusCode}
+	}
+	if resp.ContentLength > limit {
+		return fmt.Errorf("%s: %w (%d > %d байт)", url, errTooLarge, resp.ContentLength, limit)
+	}
+	cr := &countingReader{r: io.LimitReader(resp.Body, limit+1)}
+	if err := sink(cr); err != nil {
+		return err
+	}
+	if cr.n > limit {
+		return fmt.Errorf("%s: %w (%d байт)", url, errTooLarge, limit)
+	}
+	return nil
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// get скачивает небольшой файл в память.
+func (d *downloader) get(ctx context.Context, url string, limit int64) ([]byte, error) {
+	var buf bytes.Buffer
+	err := d.fetch(ctx, url, limit, func(r io.Reader) error {
+		buf.Reset()
+		_, err := buf.ReadFrom(r)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// download пишет файл потоком на диск (релиз не держим целиком в памяти).
+func (d *downloader) download(ctx context.Context, url, dst string, limit int64) error {
+	err := d.fetch(ctx, url, limit, func(r io.Reader) error {
+		f, err := os.Create(dst)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(f, r)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		return err
+	})
+	if err != nil {
+		_ = os.Remove(dst)
+	}
+	return err
+}
+
+func (a *App) dl() *downloader {
+	if a.downloader != nil {
+		return a.downloader
+	}
+	return defaultDownloader
+}
+
+// Адреса GitHub. App.rawBase/App.githubBase подменяют их в тестах.
+const (
+	defaultRawBase    = "https://raw.githubusercontent.com"
+	defaultGithubBase = "https://github.com"
+)
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+// rawURL — файл из ветки репозитория; ?t= обходит кэш CDN raw.githubusercontent.com.
 func (a *App) rawURL(file string) string {
-	return fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s?t=%d", a.Cfg.Repo, a.Cfg.Branch, file, time.Now().Unix())
+	return fmt.Sprintf("%s/%s/%s/%s?t=%d", orDefault(a.rawBase, defaultRawBase), a.Cfg.Repo, a.Cfg.Branch, file, time.Now().Unix())
+}
+
+func (a *App) releaseURL(ver string) string {
+	return fmt.Sprintf("%s/%s/releases/download/%s/zapret-discord-youtube-%s.zip",
+		orDefault(a.githubBase, defaultGithubBase), a.Cfg.Repo, ver, ver)
 }
 
 // ---------- версии ----------
 
-var localVersionRe = regexp.MustCompile(`(?im)^\s*set\s+"LOCAL_VERSION=([^"]+)"`)
-var versionRe = regexp.MustCompile(`^[0-9][0-9A-Za-z.\-]{0,30}$`)
-
 func releaseVersion(relDir string) string {
 	if data, err := os.ReadFile(filepath.Join(relDir, "service.bat")); err == nil {
-		if m := localVersionRe.FindSubmatch(data); m != nil {
-			return strings.TrimSpace(string(m[1]))
+		if v, ok := version.FromServiceBat(data); ok {
+			return v
 		}
 	}
-	base := filepath.Base(relDir)
-	if i := strings.LastIndex(base, "-"); i >= 0 && versionRe.MatchString(base[i+1:]) {
-		return base[i+1:]
-	}
-	return base
+	return version.FromDirName(filepath.Base(relDir))
 }
 
 func (a *App) fetchLatestVersion(ctx context.Context) (string, error) {
-	data, err := httpGet(ctx, a.rawURL(".service/version.txt"), 256)
+	data, err := a.dl().get(ctx, a.rawURL(".service/version.txt"), maxVersionText)
 	if err != nil {
 		return "", err
 	}
-	v := strings.TrimSpace(string(stripBOM(data)))
-	if !versionRe.MatchString(v) {
+	v := strings.TrimSpace(string(textutil.StripBOM(data)))
+	if !version.Valid(v) {
 		return "", fmt.Errorf("странная версия в version.txt: %q", v)
 	}
 	return v, nil
-}
-
-var versionTokenRe = regexp.MustCompile(`\d+|[A-Za-z]+`)
-
-// compareVersions: 1.10.4 < 1.10.5 < 1.10.5b < 1.11.0.
-func compareVersions(a, b string) int {
-	ta := versionTokenRe.FindAllString(a, -1)
-	tb := versionTokenRe.FindAllString(b, -1)
-	for i := 0; i < len(ta) && i < len(tb); i++ {
-		na, ea := strconv.Atoi(ta[i])
-		nb, eb := strconv.Atoi(tb[i])
-		switch {
-		case ea == nil && eb == nil:
-			if na != nb {
-				if na < nb {
-					return -1
-				}
-				return 1
-			}
-		case ea == nil: // число новее суффикса
-			return 1
-		case eb == nil:
-			return -1
-		default:
-			if c := strings.Compare(strings.ToLower(ta[i]), strings.ToLower(tb[i])); c != 0 {
-				return c
-			}
-		}
-	}
-	switch {
-	case len(ta) < len(tb):
-		return -1
-	case len(ta) > len(tb):
-		return 1
-	}
-	return 0
 }
 
 // ---------- релизы ----------
@@ -158,132 +266,53 @@ func validRelease(dir string) bool {
 	return err == nil && len(strategies) > 0
 }
 
-// downloadRelease скачивает zip релиза в releases\<версия>. Уже скачанный не трогает,
-// если не force; с force кладёт рядом в releases\<версия>-<время>, потому что в старой
-// папке может работать winws.
+// downloadRelease скачивает zip релиза в releases\<версия>. Уже скачанный и целый
+// не трогает (если не force). Существующую папку никогда не удаляет: в ней может
+// работать winws и лежать *-user.txt — новый релиз кладётся рядом в
+// releases\<версия>-<время>, старый уберёт pruneReleases.
 func (a *App) downloadRelease(ctx context.Context, ver string, force bool) (string, error) {
+	if !version.Valid(ver) {
+		return "", fmt.Errorf("странная версия %q", ver)
+	}
 	dest := filepath.Join(a.releasesDir(), ver)
 	if !force && validRelease(dest) {
 		return dest, nil
 	}
 	if dirExists(dest) {
-		if force || os.RemoveAll(dest) != nil {
-			dest += "-" + time.Now().Format("20060102-150405")
-		}
+		dest += "-" + time.Now().Format("20060102-150405")
 	}
-	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/zapret-discord-youtube-%s.zip", a.Cfg.Repo, ver, ver)
+	url := a.releaseURL(ver)
 	a.Log.Infof("скачиваю %s", url)
-	data, err := httpGet(ctx, url, 100<<20)
-	if err != nil {
+	tmpDir := a.path("tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return "", err
+	}
+	tmpZip := filepath.Join(tmpDir, "zapret-"+ver+".zip")
+	if err := a.dl().download(ctx, url, tmpZip, maxReleaseZip); err != nil {
 		return "", fmt.Errorf("не скачать релиз %s: %w", ver, err)
 	}
-	tmpZip := a.path("tmp", "zapret-"+ver+".zip")
-	if err := os.MkdirAll(filepath.Dir(tmpZip), 0o755); err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(tmpZip, data, 0o644); err != nil {
-		return "", err
-	}
-	defer os.Remove(tmpZip)
-	tmpDir := dest + ".new"
-	_ = os.RemoveAll(tmpDir)
-	if err := extractZip(tmpZip, tmpDir); err != nil {
-		_ = os.RemoveAll(tmpDir)
+	defer os.Remove(tmpZip) //nolint:errcheck // temp file
+	staging := dest + ".new"
+	_ = os.RemoveAll(staging)
+	if err := safezip.Extract(tmpZip, staging, safezip.DefaultLimits); err != nil {
+		_ = os.RemoveAll(staging)
 		return "", fmt.Errorf("архив релиза %s битый: %w", ver, err)
 	}
-	if !validRelease(tmpDir) {
-		_ = os.RemoveAll(tmpDir)
+	if !validRelease(staging) {
+		_ = os.RemoveAll(staging)
 		return "", fmt.Errorf("в архиве %s нет bin\\winws.exe, WinDivert или стратегий", ver)
 	}
-	if err := os.Rename(tmpDir, dest); err != nil {
+	if err := os.Rename(staging, dest); err != nil {
+		_ = os.RemoveAll(staging)
 		return "", err
 	}
 	return dest, nil
 }
 
-// extractZip распаковывает архив, срезая общую верхнюю папку (zapret-discord-youtube-X/).
-// Пути с .. и абсолютные отвергаются. CRC проверяет archive/zip при чтении.
-func extractZip(zipPath, dest string) error {
-	zr, err := zip.OpenReader(zipPath)
-	if err != nil {
-		return err
-	}
-	defer zr.Close()
-	prefix := commonZipPrefix(zr.File)
-	for _, f := range zr.File {
-		name := strings.TrimPrefix(strings.ReplaceAll(f.Name, `\`, "/"), prefix)
-		name = strings.Trim(name, "/")
-		if name == "" {
-			continue
-		}
-		if strings.Contains(name, ":") {
-			return fmt.Errorf("подозрительный путь в архиве: %s", f.Name)
-		}
-		for _, part := range strings.Split(name, "/") {
-			if part == ".." {
-				return fmt.Errorf("подозрительный путь в архиве: %s", f.Name)
-			}
-		}
-		target := filepath.Join(dest, filepath.FromSlash(path.Clean(name)))
-		if !strings.HasPrefix(strings.ToLower(target), strings.ToLower(filepath.Clean(dest)+string(os.PathSeparator))) {
-			return fmt.Errorf("путь вне папки распаковки: %s", f.Name)
-		}
-		if f.FileInfo().IsDir() {
-			if err := os.MkdirAll(target, 0o755); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
-		}
-		if err := extractZipFile(f, target); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func extractZipFile(f *zip.File, target string) error {
-	rc, err := f.Open()
-	if err != nil {
-		return err
-	}
-	defer rc.Close()
-	out, err := os.Create(target)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, io.LimitReader(rc, 200<<20)); err != nil {
-		out.Close()
-		return err
-	}
-	return out.Close()
-}
-
-func commonZipPrefix(files []*zip.File) string {
-	var top string
-	for _, f := range files {
-		name := strings.TrimPrefix(strings.ReplaceAll(f.Name, `\`, "/"), "/")
-		first, _, found := strings.Cut(name, "/")
-		if !found {
-			return "" // файл в корне архива — срезать нечего
-		}
-		if top == "" {
-			top = first
-		} else if top != first {
-			return ""
-		}
-	}
-	if top == "" {
-		return ""
-	}
-	return top + "/"
-}
-
 // migrateUserFiles переносит в новый релиз то, что пользователь настраивал в старом:
 // свои списки, game filter и режим ipset (как и делают руками при обновлении).
-func migrateUserFiles(oldDir, newDir string) {
+func migrateUserFiles(oldDir, newDir string) error {
+	var errs []error
 	for _, rel := range []string{
 		`lists\list-general-user.txt`,
 		`lists\list-exclude-user.txt`,
@@ -292,18 +321,25 @@ func migrateUserFiles(oldDir, newDir string) {
 	} {
 		src := filepath.Join(oldDir, rel)
 		if fileExists(src) {
-			_ = copyFile(src, filepath.Join(newDir, rel))
+			if err := copyFile(src, filepath.Join(newDir, rel)); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	ipsetPath := filepath.Join(newDir, "lists", "ipset-all.txt")
+	var err error
 	switch ipsetMode(oldDir) {
-	case "any":
-		_ = os.WriteFile(ipsetPath, nil, 0o644)
-	case "none":
-		_ = os.WriteFile(ipsetPath, []byte(ipsetNoneMarker+"\r\n"), 0o644)
-	case "loaded":
-		_ = copyFile(filepath.Join(oldDir, "lists", "ipset-all.txt"), ipsetPath)
+	case zapretfmt.IpsetAny:
+		err = os.WriteFile(ipsetPath, nil, 0o644)
+	case zapretfmt.IpsetNone:
+		err = os.WriteFile(ipsetPath, []byte(zapretfmt.IpsetNoneMarker+"\r\n"), 0o644)
+	case zapretfmt.IpsetLoaded:
+		err = copyFile(filepath.Join(oldDir, "lists", "ipset-all.txt"), ipsetPath)
 	}
+	if err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // pruneReleases оставляет KeepVersions свежих релизов и текущий.
@@ -324,7 +360,7 @@ func (a *App) pruneReleases(current string) {
 		}
 		vers = append(vers, name)
 	}
-	sort.Slice(vers, func(i, j int) bool { return compareVersions(vers[i], vers[j]) > 0 })
+	sort.Slice(vers, func(i, j int) bool { return version.Compare(vers[i], vers[j]) > 0 })
 	for i, v := range vers {
 		dir := filepath.Join(a.releasesDir(), v)
 		if i < a.Cfg.KeepVersions || samePath(dir, current) {
@@ -338,56 +374,24 @@ func (a *App) pruneReleases(current string) {
 
 // ---------- ipset и списки ----------
 
-func cleanLines(data []byte) []string {
-	text := strings.ReplaceAll(string(stripBOM(data)), "\r", "")
-	var out []string
-	for _, l := range strings.Split(text, "\n") {
-		out = append(out, strings.TrimSpace(l))
-	}
-	for len(out) > 0 && out[len(out)-1] == "" {
-		out = out[:len(out)-1]
-	}
-	return out
-}
-
-func validateIpset(lines []string) error {
-	total, good := 0, 0
-	for _, l := range lines {
-		if l == "" || strings.HasPrefix(l, "#") {
-			continue
-		}
-		total++
-		if _, _, err := net.ParseCIDR(l); err == nil || net.ParseIP(l) != nil {
-			good++
-		}
-	}
-	if total < 1000 {
-		return fmt.Errorf("в ipset всего %d строк — похоже на ошибку", total)
-	}
-	if good*100 < total*95 {
-		return fmt.Errorf("в ipset %d из %d строк не похожи на IP/подсеть", total-good, total)
-	}
-	return nil
-}
-
 // updateIpset кладёт свежий .service/ipset-service.txt. Режим не меняется: при loaded
 // пишется ipset-all.txt, при none/any — ipset-all.txt.backup (его поднимет service.bat
 // при включении loaded). winws перечитывает файл сам при изменении.
 func (a *App) updateIpset(ctx context.Context, relDir string) (bool, error) {
-	data, err := httpGet(ctx, a.rawURL(".service/ipset-service.txt"), 32<<20)
+	data, err := a.dl().get(ctx, a.rawURL(".service/ipset-service.txt"), maxIpsetBytes)
 	if err != nil {
 		return false, err
 	}
-	lines := cleanLines(data)
-	if err := validateIpset(lines); err != nil {
+	lines := textutil.CleanLines(data)
+	if err := zapretfmt.ValidateIpset(lines); err != nil {
 		return false, err
 	}
 	target := filepath.Join(relDir, "lists", "ipset-all.txt")
-	if ipsetMode(relDir) != "loaded" {
+	if ipsetMode(relDir) != zapretfmt.IpsetLoaded {
 		target += ".backup"
 	}
 	content := strings.Join(lines, "\r\n") + "\r\n"
-	if old, err := os.ReadFile(target); err == nil && normalizeText(string(old)) == normalizeText(content) {
+	if old, err := os.ReadFile(target); err == nil && textutil.NormalizeText(string(old)) == textutil.NormalizeText(content) {
 		return false, nil
 	}
 	if err := writeFileAtomic(target, []byte(content)); err != nil {
@@ -396,8 +400,6 @@ func (a *App) updateIpset(ctx context.Context, relDir string) (bool, error) {
 	return true, nil
 }
 
-var domainLineRe = regexp.MustCompile(`^\^?[A-Za-z0-9*_.\-]+$`)
-
 // mainLists — списки, которые Flowseal правит в main между релизами.
 var mainLists = []string{"list-general.txt", "list-google.txt", "list-exclude.txt", "ipset-exclude.txt"}
 
@@ -405,24 +407,24 @@ func (a *App) updateMainLists(ctx context.Context, relDir string) ([]string, err
 	var changed []string
 	var errs []string
 	for _, name := range mainLists {
-		data, err := httpGet(ctx, a.rawURL("lists/"+name), 4<<20)
+		data, err := a.dl().get(ctx, a.rawURL("lists/"+name), maxListBytes)
 		if err != nil {
 			errs = append(errs, name+": "+err.Error())
 			continue
 		}
-		lines := cleanLines(data)
-		if err := validateList(name, lines); err != nil {
+		lines := textutil.CleanLines(data)
+		if err := zapretfmt.ValidateList(name, lines); err != nil {
 			errs = append(errs, name+": "+err.Error())
 			continue
 		}
 		target := filepath.Join(relDir, "lists", name)
 		old, _ := os.ReadFile(target)
 		content := strings.Join(lines, "\r\n") + "\r\n"
-		if normalizeText(string(old)) == normalizeText(content) {
+		if textutil.NormalizeText(string(old)) == textutil.NormalizeText(content) {
 			continue
 		}
 		// защита от обрезанного файла: новый список не может быть меньше половины старого
-		if oldLines := len(cleanLines(old)); oldLines > 10 && len(lines)*2 < oldLines {
+		if oldLines := len(textutil.CleanLines(old)); oldLines > 10 && len(lines)*2 < oldLines {
 			errs = append(errs, fmt.Sprintf("%s: в main %d строк против %d у нас — пропускаю", name, len(lines), oldLines))
 			continue
 		}
@@ -436,27 +438,4 @@ func (a *App) updateMainLists(ctx context.Context, relDir string) ([]string, err
 		return changed, errors.New(strings.Join(errs, "; "))
 	}
 	return changed, nil
-}
-
-func validateList(name string, lines []string) error {
-	n := 0
-	for _, l := range lines {
-		if l == "" || strings.HasPrefix(l, "#") {
-			continue
-		}
-		n++
-		if strings.HasPrefix(name, "ipset") {
-			if _, _, err := net.ParseCIDR(l); err != nil && net.ParseIP(l) == nil {
-				return fmt.Errorf("строка %q не IP", l)
-			}
-			continue
-		}
-		if !domainLineRe.MatchString(l) {
-			return fmt.Errorf("строка %q не похожа на домен", l)
-		}
-	}
-	if n == 0 {
-		return errors.New("пустой список")
-	}
-	return nil
 }

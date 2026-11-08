@@ -5,11 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	"golang.org/x/sys/windows/svc"
+
+	"zapret-manager/internal/batch"
+	"zapret-manager/internal/version"
+	"zapret-manager/internal/zapretfmt"
 )
 
 var (
@@ -22,7 +27,7 @@ var (
 func (a *App) currentInstall() (relDir, strategy string) {
 	info := queryService(zapretSvcName)
 	if info.Exists && info.BinPath != "" {
-		exe := exeFromCmdline(info.BinPath)
+		exe := batch.ExeFromCmdline(info.BinPath)
 		if strings.EqualFold(filepath.Base(exe), "winws.exe") {
 			relDir = filepath.Dir(filepath.Dir(exe))
 			strategy = readRegistryStrategy()
@@ -56,7 +61,9 @@ func (a *App) applyStrategy(relDir, name string) error {
 	if err != nil {
 		return err
 	}
-	enableTCPTimestamps()
+	if err := enableTCPTimestamps(); err != nil {
+		a.Log.Warnf("TCP timestamps не включить (стратегии с fooling=ts могут не работать): %v", err)
+	}
 	oldDir, _ := a.currentInstall()
 	prev := queryService(zapretSvcName)
 	prevStrategy := readRegistryStrategy()
@@ -70,23 +77,23 @@ func (a *App) applyStrategy(relDir, name string) error {
 	if err := installZapretService(cmdline, s.Name); err != nil {
 		return err
 	}
-	err = startService(zapretSvcName, 15*time.Second)
+	err = startService(zapretSvcName)
 	if err != nil {
 		// драйвер WinDivert мог ещё выгружаться — одна повторная попытка
 		time.Sleep(3 * time.Second)
-		err = startService(zapretSvcName, 15*time.Second)
+		err = startService(zapretSvcName)
 	}
 	if err != nil {
 		// служба не говорит, что не так, — запустим ту же строку руками и покажем вывод winws
 		if p, perr := startWinws(cmdline, filepath.Join(relDir, "bin"), 3*time.Second); perr != nil {
-			err = fmt.Errorf("%v; %v", err, perr)
+			err = errors.Join(err, perr)
 		} else {
 			p.Stop()
 		}
 		// не оставляем службу со сломанной строкой — возвращаем прежнюю
 		if prev.Exists && prev.BinPath != "" && prev.BinPath != cmdline {
 			if rerr := installZapretService(prev.BinPath, prevStrategy); rerr == nil {
-				if serr := startService(zapretSvcName, 15*time.Second); serr == nil {
+				if serr := startService(zapretSvcName); serr == nil {
 					a.Log.Warnf("стратегия %s не запустилась — вернул прежнюю (%s)", s.Name, orDash(prevStrategy))
 				}
 			}
@@ -164,18 +171,21 @@ func sortRanking(r []RankEntry, current string) {
 	})
 }
 
-func (a *App) testStrategy(ctx context.Context, relDir string, s Strategy, gf GameFilter) (RankEntry, error) {
+// testStrategy запускает winws со стратегией и проверяет адреса. Ошибка самой
+// стратегии (не разбирается, winws не стартует) — это результат, а не сбой подбора:
+// она пишется в RankEntry.Error, а error возвращается только при отмене или без сети.
+func (a *App) testStrategy(ctx context.Context, relDir string, s Strategy, gf zapretfmt.GameFilter) (RankEntry, error) {
 	e := RankEntry{Strategy: s.Name}
 	cmdline, err := buildCommandLine(relDir, s, gf)
 	if err != nil {
 		e.Error = err.Error()
-		return e, nil
+		return e, nil //nolint:nilerr // strategy error is recorded in the ranking
 	}
 	killProcesses("winws.exe")
 	p, err := startWinws(cmdline, filepath.Join(relDir, "bin"), 8*time.Second)
 	if err != nil {
 		e.Error = err.Error()
-		return e, nil
+		return e, nil //nolint:nilerr // strategy error is recorded in the ranking
 	}
 	rep := runHealth(ctx, a.targets(), a.Cfg.HealthyRatio, sweepTimeout)
 	p.Stop()
@@ -189,7 +199,7 @@ func (a *App) testStrategy(ctx context.Context, relDir string, s Strategy, gf Ga
 	return e, nil
 }
 
-func (a *App) testStrategyRetry(ctx context.Context, relDir string, s Strategy, gf GameFilter) (RankEntry, error) {
+func (a *App) testStrategyRetry(ctx context.Context, relDir string, s Strategy, gf zapretfmt.GameFilter) (RankEntry, error) {
 	e, err := a.testStrategy(ctx, relDir, s, gf)
 	if errors.Is(err, errNetworkDown) {
 		if serr := sleepCtx(ctx, 5*time.Second); serr != nil {
@@ -297,7 +307,7 @@ func (a *App) selectStrategy(ctx context.Context, relDir, current string, o sele
 	defer func() {
 		killProcesses("winws.exe")
 		if !applied && prev.Exists && prev.StartType != 4 /* disabled */ {
-			if err := startService(zapretSvcName, 15*time.Second); err != nil {
+			if err := startService(zapretSvcName); err != nil {
 				a.Log.Warnf("не удалось вернуть службу zapret: %v", err)
 			}
 		}
@@ -371,7 +381,7 @@ func (a *App) heal(ctx context.Context, rep *HealthReport) {
 	a.Log.Eventf("не работает (%s): %s — перезапускаю zapret", rep.shortText(), strings.Join(rep.failures(), "; "))
 	_ = stopService(zapretSvcName, 15*time.Second)
 	killProcesses("winws.exe")
-	if err := startService(zapretSvcName, 15*time.Second); err != nil {
+	if err := startService(zapretSvcName); err != nil {
 		a.Log.Warnf("перезапуск zapret: %v", err)
 	}
 	if sleepCtx(ctx, 3*time.Second) != nil {
@@ -418,7 +428,7 @@ func (a *App) heal(ctx context.Context, rep *HealthReport) {
 	}
 	if a.Cfg.AutoUpdate {
 		a.Log.Infof("проверяю, не вышла ли новая версия zapret…")
-		if _, err := a.updateRelease(ctx, false); err != nil {
+		if err := a.updateRelease(ctx, false); err != nil {
 			a.Log.Warnf("обновление: %v", err)
 		}
 	}
@@ -428,10 +438,10 @@ func (a *App) heal(ctx context.Context, rep *HealthReport) {
 
 // updateRelease ставит новый релиз Flowseal: качает, переносит настройки, ставит ту же
 // стратегию (или подбирает), сравнивает с тем, что было, и откатывается, если стало хуже.
-func (a *App) updateRelease(ctx context.Context, force bool) (bool, error) {
+func (a *App) updateRelease(ctx context.Context, force bool) error {
 	latest, err := a.fetchLatestVersion(ctx)
 	if err != nil {
-		return false, fmt.Errorf("не узнать последнюю версию: %w", err)
+		return fmt.Errorf("не узнать последнюю версию: %w", err)
 	}
 	a.updateState(func(st *State) { st.LatestVersion = latest })
 	relDir, strategy := a.currentInstall()
@@ -440,30 +450,28 @@ func (a *App) updateRelease(ctx context.Context, force bool) (bool, error) {
 		cur = releaseVersion(relDir)
 	}
 	st := a.loadState()
-	if !force && cur != "" && compareVersions(latest, cur) <= 0 {
+	if !force && cur != "" && version.Compare(latest, cur) <= 0 {
 		a.Log.Infof("zapret %s — последняя версия", cur)
-		return false, nil
+		return nil
 	}
-	if !force {
-		for _, bad := range st.BadVersions {
-			if bad == latest {
-				a.Log.Infof("версия %s уже откатывалась как нерабочая — пропускаю (update --force поставит)", latest)
-				return false, nil
-			}
-		}
+	if !force && slices.Contains(st.BadVersions, latest) {
+		a.Log.Infof("версия %s уже откатывалась как нерабочая — пропускаю (update --force поставит)", latest)
+		return nil
 	}
 	if cur != "" && cur != latest {
 		a.Log.Eventf("вышел zapret %s (стоит %s) — обновляю", latest, cur)
 	}
 	newDir, err := a.downloadRelease(ctx, latest, force)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if relDir != "" && !samePath(relDir, newDir) {
-		migrateUserFiles(relDir, newDir)
+		if err := migrateUserFiles(relDir, newDir); err != nil {
+			a.Log.Warnf("перенос своих списков и настроек: %v", err)
+		}
 	}
 	if err := ensureUserLists(newDir); err != nil {
-		return false, err
+		return err
 	}
 	if a.Cfg.UpdateIpset {
 		if _, err := a.updateIpset(ctx, newDir); err != nil {
@@ -477,11 +485,11 @@ func (a *App) updateRelease(ctx context.Context, force bool) (bool, error) {
 	}
 	if relDir == "" || strategy == "" {
 		_, _, err := a.selectStrategy(ctx, newDir, "", selectOpts{apply: true})
-		return err == nil, err
+		return err
 	}
 	if samePath(relDir, newDir) {
 		// та же папка (force): просто переставим текущую стратегию
-		return true, a.applyStrategy(newDir, strategy)
+		return a.applyStrategy(newDir, strategy)
 	}
 
 	var base *HealthReport
@@ -507,27 +515,39 @@ func (a *App) updateRelease(ctx context.Context, force bool) (bool, error) {
 			a.Log.Warnf("подбор: %v", err)
 		}
 	}
-	worse := base != nil && !base.NetworkDown && base.Healthy &&
-		(rep == nil || (!rep.NetworkDown && (!rep.Healthy || rep.Score < base.Score)))
-	if worse {
+	if releaseIsWorse(base, rep) {
 		a.Log.Eventf("zapret %s работает хуже, чем %s — откатываюсь", latest, cur)
 		if err := a.applyStrategy(relDir, strategy); err != nil {
-			return false, fmt.Errorf("откат не удался: %w", err)
+			return fmt.Errorf("откат не удался: %w", err)
 		}
 		a.updateState(func(st *State) { st.BadVersions = appendUnique(st.BadVersions, latest) })
-		return false, errors.New("новая версия хуже — оставил прежнюю")
+		return errors.New("новая версия хуже — оставил прежнюю")
 	}
 	_, nowStrategy := a.currentInstall()
 	a.Log.Eventf("zapret обновлён: %s → %s, стратегия %s", cur, latest, nowStrategy)
 	a.pruneReleases(newDir)
-	return true, nil
+	return nil
+}
+
+// releaseIsWorse решает, откатывать ли новый релиз. base — замер на старом релизе
+// (nil, если zapret не работал), rep — на новом (nil, если ни одна стратегия не встала).
+// Откатываемся, только если старый релиз был здоров, а новый — нет или открывает меньше.
+// Без интернета во время замера (NetworkDown) не судим: это не вина релиза.
+func releaseIsWorse(base, rep *HealthReport) bool {
+	if base == nil || base.NetworkDown || !base.Healthy {
+		return false
+	}
+	if rep == nil {
+		return true
+	}
+	return !rep.NetworkDown && (!rep.Healthy || rep.Score < base.Score)
 }
 
 // updateAll — плановое обновление: релиз, ipset, списки, hosts. manual=true — по команде
 // пользователя (тогда выключенные в конфиге пункты тоже выполняются, кроме hosts).
 func (a *App) updateAll(ctx context.Context, manual, force bool) {
 	if a.Cfg.AutoUpdate || manual {
-		if _, err := a.updateRelease(ctx, force); err != nil {
+		if err := a.updateRelease(ctx, force); err != nil {
 			a.Log.Warnf("релиз: %v", err)
 		}
 	}
@@ -585,10 +605,8 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 }
 
 func appendUnique(list []string, v string) []string {
-	for _, x := range list {
-		if x == v {
-			return list
-		}
+	if slices.Contains(list, v) {
+		return list
 	}
 	return append(list, v)
 }

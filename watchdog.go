@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"time"
 
 	"golang.org/x/sys/windows/svc"
@@ -34,8 +35,10 @@ func (m *managerService) Execute(_ []string, r <-chan svc.ChangeRequest, changes
 	go func() {
 		defer close(done)
 		defer func() {
+			// Паника не глушится: пишем стек для разбора, служба завершается с кодом 1,
+			// и SCM перезапускает её по recovery actions (10 с / 30 с / 2 мин).
 			if rec := recover(); rec != nil {
-				m.app.Log.Warnf("сторож упал: %v", rec)
+				m.app.Log.Warnf("сторож упал: %v\n%s", rec, debug.Stack())
 			}
 		}()
 		m.app.watchdog(ctx, wake)
@@ -75,6 +78,7 @@ func (m *managerService) Execute(_ []string, r <-chan svc.ChangeRequest, changes
 // watchdog — главный цикл службы.
 func (a *App) watchdog(ctx context.Context, wake <-chan string) {
 	a.Log.Eventf("сторож запущен (zapret-manager %s, папка %s)", appVersion, a.Root)
+	a.ensureRootSecure()
 	fails := 0
 	now := time.Now()
 	nextCheck := now.Add(45 * time.Second)
@@ -151,7 +155,7 @@ func (a *App) handlePause(now time.Time) bool {
 	a.Log.Eventf("пауза закончилась — включаю zapret")
 	a.updateState(func(s *State) { s.PausedUntil = time.Time{} })
 	_ = setServiceStartType(zapretSvcName, mgr.StartAutomatic)
-	if err := startService(zapretSvcName, 15*time.Second); err != nil {
+	if err := startService(zapretSvcName); err != nil {
 		a.Log.Warnf("zapret: %v", err)
 	}
 	return false
@@ -176,7 +180,7 @@ func (a *App) ensureRunning() {
 		if info.StartType == mgr.StartDisabled {
 			_ = setServiceStartType(zapretSvcName, mgr.StartAutomatic)
 		}
-		if err := startService(zapretSvcName, 15*time.Second); err != nil {
+		if err := startService(zapretSvcName); err != nil {
 			a.lastStartFail = time.Now()
 			a.Log.Warnf("zapret не запускается (%v) — следующая попытка через 5 минут", err)
 		}
@@ -210,7 +214,7 @@ func (a *App) periodicCheck(ctx context.Context, fails *int) time.Duration {
 			if info.StartType == mgr.StartDisabled {
 				_ = setServiceStartType(zapretSvcName, mgr.StartAutomatic)
 			}
-			if err := startService(zapretSvcName, 15*time.Second); err != nil {
+			if err := startService(zapretSvcName); err != nil {
 				a.Log.Warnf("%v", err)
 			}
 			_ = sleepCtx(ctx, 3*time.Second)
@@ -220,7 +224,7 @@ func (a *App) periodicCheck(ctx context.Context, fails *int) time.Duration {
 
 		rep := a.checkNow(ctx)
 		if ctx.Err() != nil {
-			return nil
+			return nil //nolint:nilerr // service is stopping: not a check failure to log
 		}
 		switch {
 		case rep.NetworkDown:

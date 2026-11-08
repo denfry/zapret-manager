@@ -17,6 +17,8 @@ import (
 
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
+
+	"zapret-manager/internal/hostsfile"
 )
 
 const (
@@ -161,10 +163,29 @@ func cmdInstall(ctx context.Context, a *App, args []string) int {
 	say, warn := a.Log.Infof, a.Log.Warnf
 	say("Ставлю zapret-manager %s в %s", appVersion, a.Root)
 
+	// Папка целиком закрывается на запись для всех, кроме администраторов, —
+	// значит, в ней не должно быть чужих файлов (например, это не рабочий стол).
+	dedicated, foreign, err := rootIsDedicated(a.Root)
+	if err != nil {
+		return fail(err)
+	}
+	if !dedicated {
+		return fail(fmt.Errorf("в %s есть посторонние файлы (%s). zapret-manager закрывает свою папку на запись "+
+			"для всех, кроме администраторов, поэтому нужна отдельная папка: install --dir ПАПКА",
+			a.Root, strings.Join(foreign, ", ")))
+	}
 	if err := stopManagerIfRunning(); err != nil {
 		return fail(err)
 	}
-	for _, d := range []string{a.Root, a.releasesDir(), a.customDir(), a.path("logs"), a.path("backups")} {
+	if err := os.MkdirAll(a.Root, 0o755); err != nil {
+		return fail(err)
+	}
+	// Права ставим до копирования exe: всё, что появится внутри, их унаследует.
+	if err := secureTree(a.Root, true); err != nil {
+		return fail(fmt.Errorf("не закрыть папку %s на запись: %w", a.Root, err))
+	}
+	say("✓ папка %s: менять файлы может только администратор", a.Root)
+	for _, d := range []string{a.releasesDir(), a.customDir(), a.path("logs"), a.path("backups")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return fail(err)
 		}
@@ -176,7 +197,7 @@ func cmdInstall(ctx context.Context, a *App, args []string) int {
 	target := a.path("zapret-manager.exe")
 	if !samePath(exe, target) {
 		var cerr error
-		for i := 0; i < 10; i++ {
+		for range 10 { // exe службы освобождается не сразу после её остановки
 			if cerr = copyFile(exe, target); cerr == nil {
 				break
 			}
@@ -230,8 +251,11 @@ func cmdInstall(ctx context.Context, a *App, args []string) int {
 		}
 		say("✓ zapret %s в %s", releaseVersion(newDir), newDir)
 		if oldDir != "" && !samePath(oldDir, newDir) {
-			migrateUserFiles(oldDir, newDir)
-			say("✓ перенёс свои списки, game filter и режим ipset")
+			if err := migrateUserFiles(oldDir, newDir); err != nil {
+				warn("перенос своих списков и настроек: %v", err)
+			} else {
+				say("✓ перенёс свои списки, game filter и режим ipset")
+			}
 		}
 		if err := ensureUserLists(newDir); err != nil {
 			return err
@@ -334,7 +358,7 @@ func cmdInstall(ctx context.Context, a *App, args []string) int {
 			warn("служба-сторож: %v", err)
 			return 1
 		}
-		if err := startService(managerSvcName, 15*time.Second); err != nil {
+		if err := startService(managerSvcName); err != nil {
 			warn("служба-сторож: %v", err)
 			return 1
 		}
@@ -344,7 +368,8 @@ func cmdInstall(ctx context.Context, a *App, args []string) int {
 	fmt.Println()
 	cmdStatus(ctx, a, nil)
 	relDir, _ := a.currentInstall()
-	if previousDir != "" && !samePath(previousDir, relDir) && !strings.HasPrefix(strings.ToLower(previousDir), strings.ToLower(a.releasesDir())) {
+	// не советуем удалять папку, внутри которой лежит сама установка (релиз распакован прямо в C:\zapret)
+	if previousDir != "" && !samePath(previousDir, relDir) && !isWithin(previousDir, a.Root) && !isWithin(a.Root, previousDir) {
 		fmt.Printf("\nСтарая папка %s больше не используется — её можно удалить.\n", previousDir)
 	}
 	return 0
@@ -450,15 +475,9 @@ func (a *App) lastEvents(n int) []string {
 		return nil
 	}
 	var out []string
-	for _, l := range strings.Split(strings.ReplaceAll(string(data), "\r", ""), "\n") {
-		if i := strings.Index(l, " "+lvlEvent+" "); i > 0 {
-			ts, err := time.ParseInLocation("2006-01-02 15:04:05", l[:i], time.Local)
-			msg := l[i+len(lvlEvent)+2:]
-			if err == nil {
-				out = append(out, ts.Format("02.01 15:04")+"  "+msg)
-			} else {
-				out = append(out, msg)
-			}
+	for l := range strings.SplitSeq(strings.ReplaceAll(string(data), "\r", ""), "\n") {
+		if ts, msg, ok := parseEventLine(l); ok {
+			out = append(out, ts.Format("02.01 15:04")+"  "+msg)
 		}
 	}
 	if len(out) > n {
@@ -641,7 +660,12 @@ func cmdUpdate(ctx context.Context, a *App, args []string) int {
 }
 
 func cmdHosts(ctx context.Context, a *App, _ []string) int {
-	changed, err := a.updateHosts(ctx)
+	var changed bool
+	err := a.withLock(3*time.Minute, func() error {
+		var err error
+		changed, err = a.updateHosts(ctx)
+		return err
+	})
 	if err != nil {
 		return fail(err)
 	}
@@ -668,8 +692,10 @@ func cmdOff(_ context.Context, a *App, args []string) int {
 		until = time.Now().Add(time.Duration(m) * time.Minute)
 	}
 	err := a.withLock(3*time.Minute, func() error {
+		// паузу ставим до остановки: иначе сторож может успеть поднять службу обратно
 		a.updateState(func(st *State) { st.PausedUntil = until })
 		if err := stopService(zapretSvcName, 15*time.Second); err != nil {
+			a.updateState(func(st *State) { st.PausedUntil = time.Time{} })
 			return err
 		}
 		killProcesses("winws.exe")
@@ -693,7 +719,7 @@ func cmdOn(ctx context.Context, a *App, _ []string) int {
 	err := a.withLock(3*time.Minute, func() error {
 		a.updateState(func(st *State) { st.PausedUntil = time.Time{} })
 		_ = setServiceStartType(zapretSvcName, mgr.StartAutomatic)
-		return startService(zapretSvcName, 15*time.Second)
+		return startService(zapretSvcName)
 	})
 	if err != nil {
 		return fail(err)
@@ -720,6 +746,10 @@ func cmdLog(_ context.Context, a *App, args []string) int {
 		}
 	}
 	f, err := os.Open(a.path("logs", "manager.log"))
+	if errors.Is(err, os.ErrNotExist) {
+		fmt.Println("Журнал пока пуст:", a.path("logs", "manager.log"))
+		return 0
+	}
 	if err != nil {
 		return fail(err)
 	}
@@ -760,7 +790,7 @@ func cmdUninstall(_ context.Context, a *App, args []string) int {
 		removeWinDivert()
 		fmt.Println("✓ WinDivert остановлен")
 		if data, err := os.ReadFile(hostsPath()); err == nil {
-			if out, changed := removeHostsBlock(string(data)); changed {
+			if out, changed := hostsfile.RemoveBlock(string(data)); changed {
 				if err := a.writeHosts(data, out); err != nil {
 					fmt.Println("! hosts:", err)
 				} else {

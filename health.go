@@ -173,25 +173,37 @@ func (r *HealthReport) shortText() string {
 	return s
 }
 
+// runHealth проверяет все адреса параллельно (их не больше maxTargets — по одной
+// горутине и одному соединению на адрес) и сводит результат.
 func runHealth(ctx context.Context, targets []Target, ratio float64, timeout time.Duration) *HealthReport {
-	rep := &HealthReport{Time: time.Now(), Groups: map[string]*GroupStat{}}
+	return runHealthWith(ctx, targets, ratio, timeout, nil)
+}
+
+func runHealthWith(ctx context.Context, targets []Target, ratio float64, timeout time.Duration, roots *x509.CertPool) *HealthReport {
 	results := make([]CheckResult, len(targets))
 	var wg sync.WaitGroup
 	for i, t := range targets {
-		wg.Add(1)
-		go func(i int, t Target) {
-			defer wg.Done()
-			r := checkTarget(ctx, t, timeout, maxBodyBytes)
-			if r.Kind == "dns" && ctx.Err() == nil {
+		wg.Go(func() {
+			r := checkTarget(ctx, t, timeout, roots)
+			if r.Kind == "dns" && sleepCtx(ctx, 500*time.Millisecond) == nil {
 				// одиночные сбои резолвера бывают (особенно с VPN, перехватывающим DNS) — повторим
-				time.Sleep(500 * time.Millisecond)
-				r = checkTarget(ctx, t, timeout, maxBodyBytes)
+				r = checkTarget(ctx, t, timeout, roots)
 			}
 			results[i] = r
-		}(i, t)
+		})
 	}
 	wg.Wait()
-	rep.Results = results
+	return summarize(results, ratio)
+}
+
+// summarize — решающая логика сторожа:
+//   - NetworkDown: не открылся ни один контрольный адрес (группа control) — интернета нет,
+//     zapret не виноват, ничего не трогаем;
+//   - DNSProblem: хотя бы половина неудач — DNS или подменённый сертификат, смена стратегии
+//     не поможет;
+//   - Healthy: есть интернет и в каждой группе, кроме control, открылась доля ≥ ratio.
+func summarize(results []CheckResult, ratio float64) *HealthReport {
+	rep := &HealthReport{Time: time.Now(), Groups: map[string]*GroupStat{}, Results: results}
 	failed, dnsLike := 0, 0
 	for _, res := range results {
 		g := rep.Groups[res.Group]
@@ -235,10 +247,12 @@ func runHealth(ctx context.Context, targets []Target, ratio float64, timeout tim
 
 const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
 
-// checkTarget делает настоящий запрос: TCP → TLS → GET → читает тело до maxBody.
+// checkTarget делает настоящий запрос: TCP → TLS → GET → читает тело до maxBodyBytes.
 // Фаза, на которой всё сломалось, говорит, что именно режет провайдер.
 // Системный прокси не используем: проверяем прямой путь, через который идёт zapret.
-func checkTarget(ctx context.Context, t Target, timeout time.Duration, maxBody int64) (res CheckResult) {
+// Любой HTTP-ответ (и 4xx/5xx) — успех: проверяется путь до сервера, а не сам сервис.
+// roots == nil — системные корневые сертификаты (параметр нужен тестам).
+func checkTarget(ctx context.Context, t Target, timeout time.Duration, roots *x509.CertPool) (res CheckResult) {
 	res = CheckResult{Target: t}
 	start := time.Now()
 	defer func() { res.Elapsed = time.Since(start) }()
@@ -268,13 +282,10 @@ func checkTarget(ctx context.Context, t Target, timeout time.Duration, maxBody i
 		return
 	}
 	sort.SliceStable(addrs, func(i, j int) bool { return addrs[i].IP.To4() != nil && addrs[j].IP.To4() == nil })
-	connectTimeout := timeout / 2
-	if connectTimeout > 4*time.Second {
-		connectTimeout = 4 * time.Second
-	}
+	connectTimeout := min(timeout/2, 4*time.Second)
 	var conn net.Conn
 	for i, ip := range addrs {
-		if i >= 2 {
+		if i >= 2 { // IPv4 первым; больше двух адресов за один бюджет не успеть
 			break
 		}
 		d := net.Dialer{Timeout: connectTimeout}
@@ -287,12 +298,12 @@ func checkTarget(ctx context.Context, t Target, timeout time.Duration, maxBody i
 		res.Kind, res.Detail = classifyErr(err, "connect"), err.Error()
 		return
 	}
-	defer conn.Close()
+	defer conn.Close() //nolint:errcheck // probe connection
 	_ = conn.SetDeadline(deadline)
 
-	var rw net.Conn = conn
+	rw := conn
 	if u.Scheme == "https" {
-		tc := tls.Client(conn, &tls.Config{ServerName: host, NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
+		tc := tls.Client(conn, &tls.Config{ServerName: host, NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12, RootCAs: roots})
 		if err := tc.HandshakeContext(ctx); err != nil {
 			res.Kind, res.Detail = classifyErr(err, "tls"), err.Error()
 			return
@@ -315,9 +326,9 @@ func checkTarget(ctx context.Context, t Target, timeout time.Duration, maxBody i
 		res.Kind, res.Detail = classifyErr(err, "no-response"), err.Error()
 		return
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // probe response
 	res.Status = resp.StatusCode
-	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, maxBody))
+	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))
 	res.Bytes = n
 	if err != nil {
 		kind := classifyErr(err, "freeze")
@@ -332,8 +343,7 @@ func checkTarget(ctx context.Context, t Target, timeout time.Duration, maxBody i
 }
 
 func classifyErr(err error, phase string) string {
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
+	if _, ok := errors.AsType[*net.DNSError](err); ok {
 		return "dns"
 	}
 	var certErr *tls.CertificateVerificationError

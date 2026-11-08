@@ -1,3 +1,5 @@
 ﻿dist/
 *.exe
-
+*.test
+coverage.out
+*.prof

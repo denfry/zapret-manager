@@ -1,0 +1,105 @@
+# Quality gate. Program is Windows-only (SCM, WinDivert, ACL), so everything runs
+# on windows-latest. Actions are pinned by commit SHA; tool versions are pinned too —
+# Dependabot (.github/dependabot.yml) proposes updates.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 5 * * 1" # weekly: fresh govulncheck data even without commits
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOLANGCI_LINT_VERSION: v2.15.0
+  GOVULNCHECK_VERSION: v1.9.0
+  STATICCHECK_VERSION: v0.8.2
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod # toolchain directive pins the patched Go release
+
+      - name: gofmt
+        shell: pwsh
+        run: |
+          $files = gofmt -l .
+          if ($files) { Write-Output "Not gofmt-ed:"; $files; exit 1 }
+
+      - name: go mod verify / tidy
+        shell: pwsh
+        run: |
+          go mod verify
+          go mod tidy -diff
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@${{ env.STATICCHECK_VERSION }} ./...
+
+      - name: tests (race detector)
+        env:
+          CGO_ENABLED: "1" # -race needs cgo; the runner ships MinGW gcc
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: coverage summary
+        shell: pwsh
+        run: go tool cover -func=coverage.out | Select-Object -Last 1
+
+      - name: fuzz smoke (15s per target)
+        shell: pwsh
+        run: |
+          $targets = @(
+            @{ pkg = "./internal/batch";     fn = "FuzzExtractWinwsArgs" },
+            @{ pkg = "./internal/batch";     fn = "FuzzExeFromCmdline" },
+            @{ pkg = "./internal/batch";     fn = "FuzzUnescapeCarets" },
+            @{ pkg = "./internal/hostsfile"; fn = "FuzzMerge" },
+            @{ pkg = "./internal/hostsfile"; fn = "FuzzParseUpstream" },
+            @{ pkg = "./internal/safezip";   fn = "FuzzEntryPath" },
+            @{ pkg = "./internal/version";   fn = "FuzzCompare" },
+            @{ pkg = "./internal/zapretfmt"; fn = "FuzzParseGameFilter" }
+          )
+          foreach ($t in $targets) {
+            go test -run '^$' -fuzz "^$($t.fn)$" -fuzztime 15s $t.pkg
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }} ./...
+
+      - name: build
+        shell: pwsh
+        run: |
+          go build -trimpath -ldflags "-s -w" -o dist/zapret-manager.exe .
+          go version -m dist/zapret-manager.exe | Tee-Object dist/zapret-manager.modules.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zapret-manager
+          path: |
+            dist/zapret-manager.exe
+            dist/zapret-manager.modules.txt
+            coverage.out
+          retention-days: 14
