@@ -107,6 +107,27 @@ func (g GameFilter) Vars() (anyProto, tcp, udp string) {
 	return emptyPort, emptyPort, emptyPort
 }
 
+// FileContent is utils\game_filter.enabled as save_game_filter_settings in
+// service.bat writes it. Ranges are re-validated so that a hand-built value
+// can never put anything but [0-9,-] into the winws command line.
+func (g GameFilter) FileContent() string {
+	tcp, ok := ValidatePortRanges(g.TCPRange)
+	if !ok {
+		tcp = DefaultPortRange
+	}
+	udp, ok := ValidatePortRanges(g.UDPRange)
+	if !ok {
+		udp = DefaultPortRange
+	}
+	mode := g.Mode
+	switch mode {
+	case ModeAll, ModeTCP, ModeUDP:
+	default:
+		mode = ModeDisabled
+	}
+	return "mode=" + mode + "\r\ntcp=" + tcp + "\r\nudp=" + udp + "\r\n"
+}
+
 func (g GameFilter) String() string {
 	switch g.Mode {
 	case ModeAll:

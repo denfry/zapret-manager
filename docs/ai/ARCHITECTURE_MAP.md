@@ -10,11 +10,11 @@ menu.go → main.go (CLI)  watchdog.go (служба)
         \                  /
          engine.go — бизнес-логика: install/select/heal/update
         /     |      \        \
- strategy.go health.go release.go hosts.go security.go doctor.go
+ strategy.go health.go release.go hosts.go security.go doctor.go sites.go
         \     |      /        /
           winsys.go — SCM, реестр, процессы, Job Object, UAC   app.go — Config/State/locks/log
                  \
-   internal/: batch  hostsfile  safezip  version  zapretfmt  textutil   (чистые, без x/sys/windows)
+   internal/: batch  hostsfile  safezip  sitelist  version  zapretfmt  textutil   (чистые, без x/sys/windows)
 ```
 
 Зависимости направлены вниз. `internal/*` не импортируют пакет main и друг друга, кроме
@@ -33,8 +33,21 @@ menu.go → main.go (CLI)  watchdog.go (служба)
 
 **Плановая проверка (служба, раз в `check_interval_sec`):**
 `watchdog` → `periodicCheck` (под `.lock`) → `currentInstall` → поднять службу, если
-лежит → `checkNow` → `runHealth` → `summarize` → после `failures_before_heal` неудач →
-`heal`: перезапуск → `selectStrategy{quick}` → полный `sweep` → `updateRelease`.
+лежит → `checkNow` → `runHealth(targetsFor(relDir), skippedGroups())` → `summarize` → после
+`failures_before_heal` неудач → `heal`: перезапуск → `selectStrategy{quick}` → полный `sweep`
+→ `updateRelease`.
+
+**Что проверять:** `targetsFor(relDir)` = стандартные адреса (или `targets` из config.json)
++ проверки включённых сервисов каталога + первые 10 своих доменов из `list-general-user.txt`.
+Полный `sweep` считает `unfixableGroups` — группы, которые не открыла ни одна стратегия; они
+пишутся в `LastSweep.Unfixable` и сутки не влияют на `Healthy` (`skippedGroups`). Discord,
+YouTube и control туда не попадают никогда.
+
+**Что разблокировать (`sites`, пункт меню):** `planSites` (разбор и проверка ввода, до UAC) →
+`withLock` → `applySites`: `editSiteFiles` (списки через `sitelist`, режим ipset через
+`setIpsetMode`) → `forgetUnfixable` для затронутых групп → `restartZapretIfRunning`; игры —
+`setGameFilter` → `applyStrategy` (порты в командной строке, откат файла при неудаче).
+Плановое обновление вызывает `syncCatalog` — домены включённых сервисов по каталогу.
 
 **Обновление (служба, раз в `update_interval_hours`; `update`):**
 `updateAll` → `updateRelease` (version.txt → `downloadRelease` → `safezip.Extract` →
@@ -59,4 +72,5 @@ menu.go → main.go (CLI)  watchdog.go (служба)
 | `C:\zapret\.lock` | менеджер | долгие операции (подбор, обновление, смена стратегии) |
 | `C:\zapret\logs\manager.log` | менеджер | `[ ]` info, `[*]` событие (видно в status), `[!]` warn, `[.]` debug; ротация 2 МБ |
 | `releases\<версия>\` | Flowseal + менеджер | релиз как есть; новые версии кладутся рядом, старые чистит `pruneReleases` |
+| `releases\<версия>\lists\list-general-user.txt` | пользователь + менеджер (блок между маркерами) | единственное место, где записано, какие сервисы включены; переносится `migrateUserFiles` |
 | служба `zapret`, `HKLM\...\Services\zapret` | менеджер / service.bat | источник правды о текущей стратегии |

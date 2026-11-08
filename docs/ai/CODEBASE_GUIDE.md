@@ -19,6 +19,10 @@
 | I13 | «Нет интернета» (control недоступны) — ничего не чиним | `summarize`, `periodicCheck` | `TestSummarize` |
 | I14 | Любой HTTP-ответ (и 4xx/5xx) = путь открыт | `checkTarget` | `TestCheckTargetHTTPErrorStatusIsReachable` |
 | I15 | HTTP: лимит размера, https-редиректы, повтор только временных ошибок | `downloader` | `TestDownloader*` |
+| I16 | Блок сервисов в list-general-user.txt: запись идемпотентна, чужие строки не теряются, файл не пустой | `internal/sitelist` | `FuzzRender`, `TestParseKeepsForeignLines` |
+| I17 | Домен от пользователя попадает в список только как `[a-z0-9.-]` (без IP, кириллицы, масок) | `sitelist.NormalizeDomain` | `FuzzNormalizeDomain`, `TestNormalizeDomain` |
+| I18 | Discord, YouTube и control никогда не пропускаются; прочая группа пропускается ≤ 24 ч после полного подбора, где её не открыла ни одна стратегия | `unfixableGroups`, `skippedGroups` | `TestUnfixableGroups`, `TestSkippedGroups`, `TestSummarizeSkip` |
+| I19 | Смена режима ipset не теряет список подсетей: он уходит в `.backup` и возвращается оттуда (или скачивается) | `setIpsetMode` | `TestSetIpsetMode*` |
 
 ## Опасные места
 
@@ -34,6 +38,9 @@
   `withLock(0, …)` — одна попытка: служба пропускает цикл, если CLI занят.
 - **Пути.** Сравнение путей — только `samePath`/`isWithin` (регистронезависимо).
 - **Время.** Бесконечная пауза хранится как 9999-01-01 (`PausedUntil.Year() > 3000`).
+- **Тесты и живая служба.** `currentInstall`, `applyStrategy`, `restartZapretIfRunning` трогают
+  настоящую службу `zapret` на машине разработчика. Логику, которую надо тестировать, держи в
+  функциях с явным `relDir` (как `editSiteFiles`, `setIpsetMode`).
 
 ## Где бизнес-логика
 
@@ -47,6 +54,8 @@
 |---|---|---|
 | разбор .bat | служба не стартует у всех пользователей | `TestRealStrategies` с `ZAPRET_TEST_DIR`, `TestMatchesServiceBatInstall` |
 | пороги/классификация в health | ложные подборы (мигает Discord) или пропуск поломок | `TestSummarize`, `TestClassifyErr`, `TestCheckTarget*` |
+| каталог сервисов (`siteCatalog`) | лишние подборы, если адрес проверки не открывается сам по себе (свой CA, нужен вход) | `TestCatalogIsValid` + пробная `check` с этими адресами в `targets` во временной папке |
+| `unfixableGroups` / TTL | бесконечные подборы ради сервиса, который zapret не открывает, или наоборот — непочиненный сервис | `TestUnfixableGroups`, `TestSkippedGroups`, `TestRehealth` |
 | форматы state/config | потеря паузы, BadVersions | `TestStateRoundTrip` |
 | ACL | lock-out администратора или LPE | `TestSecureTree*` + ручной `install` |
 | hosts | поломка DNS у пользователя | `FuzzMerge` + `ZM_NET=1` предпросмотр |

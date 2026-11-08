@@ -49,7 +49,7 @@
 - Служба `zapret` (winws + WinDivert) перехватывает трафик по спискам/ipset стратегии.
 - `netsh interface tcp set global timestamps=enabled` — нужно стратегиям с `fooling=ts`.
 - `DnsFlushResolverCache` после изменения hosts.
-- Подбор перебирает стратегии: на 1–3 минуты Discord и YouTube «мигают».
+- Подбор перебирает стратегии: на 1–3 минуты Discord, YouTube и включённые сайты «мигают».
 
 ## Диагностика сети
 

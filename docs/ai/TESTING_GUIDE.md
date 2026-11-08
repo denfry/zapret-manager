@@ -4,8 +4,8 @@
 
 | Уровень | Где | Что нужно | Запуск |
 |---|---|---|---|
-| unit | `internal/*/*_test.go`, `engine_test.go`, `app_test.go` | ничего | `go test ./...` |
-| fuzz | `Fuzz*` в `internal/*` (8 целей) | ничего | `go test -run '^$' -fuzz '^FuzzMerge$' -fuzztime 30s ./internal/hostsfile` |
+| unit | `internal/*/*_test.go`, `engine_test.go`, `app_test.go`, `sites_test.go`, `menu_test.go` | ничего | `go test ./...` |
+| fuzz | `Fuzz*` в `internal/*` (10 целей) | ничего | `go test -run '^$' -fuzz '^FuzzMerge$' -fuzztime 30s ./internal/hostsfile` |
 | сеть (локально) | `health_test.go`, `release_test.go`, `update_test.go` | ничего — `httptest`/`127.0.0.1` | `go test ./...` |
 | ОС (ACL) | `security_test.go` | Windows; без админа проверяет ещё и запрет записи | `go test -run TestSecureTree .` |
 | интеграция с релизом | `TestRealStrategies` | распакованный релиз (`ZAPRET_TEST_DIR` или Desktop) | skip без релиза |

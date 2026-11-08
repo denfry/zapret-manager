@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -19,6 +20,7 @@ import (
 
 	"zapret-manager/internal/batch"
 	"zapret-manager/internal/textutil"
+	"zapret-manager/internal/zapretfmt"
 )
 
 // Меню — то, что видит человек, дважды щёлкнувший по exe. Каждый пункт вызывает
@@ -42,6 +44,7 @@ type menuView struct {
 	SelfExe       string // exe, из которого открыто меню
 	PausedUntil   time.Time
 	LastCheck     *CheckSummary
+	Sites         sitesView // что разблокирует zapret (только если установлен)
 	Now           time.Time
 }
 
@@ -69,6 +72,7 @@ func (a *App) menuSnapshot() menuView {
 	}
 	if relDir != "" {
 		v.Version = releaseVersion(relDir)
+		v.Sites = a.readSitesView(relDir)
 	}
 	if mi.Exists {
 		v.ManagerExe = batch.ExeFromCmdline(mi.BinPath)
@@ -128,8 +132,14 @@ func statusLines(v menuView) []statusLine {
 	default:
 		out = append(out, statusLine{"автопочинка", "служба-сторож " + stateName(v.ManagerState), moodBad})
 	}
+	if v.installed() {
+		out = append(out, coverageLine(v.Sites))
+	}
 	if c := v.LastCheck; c != nil {
 		text := c.Time.Format("02.01 15:04") + " — Discord " + c.Discord + ", YouTube " + c.YouTube
+		if ok, total := otherTotals(c); total > 0 {
+			text += fmt.Sprintf(", остальное %d/%d", ok, total)
+		}
 		m := moodOK
 		switch {
 		case c.NetworkDown:
@@ -146,6 +156,46 @@ func statusLines(v menuView) []statusLine {
 		out = append(out, statusLine{"проверка", "ещё не было", moodNone})
 	}
 	return out
+}
+
+// otherTotals — сколько адресов сервисов и своих сайтов открылось (без пропущенных
+// групп: их сторож не чинит, и в шапке они только пугали бы).
+func otherTotals(c *CheckSummary) (ok, total int) {
+	for name, g := range c.Groups {
+		if slices.Contains(c.Skipped, name) {
+			continue
+		}
+		ok += g.OK
+		total += g.Total
+	}
+	return ok, total
+}
+
+// coverageLine — коротко, что сейчас разблокирует zapret.
+func coverageLine(s sitesView) statusLine {
+	parts := []string{map[string]string{
+		zapretfmt.IpsetAny:    "все сайты",
+		zapretfmt.IpsetLoaded: "по спискам",
+		zapretfmt.IpsetNone:   "только домены из списков",
+	}[s.Mode]}
+	if parts[0] == "" {
+		parts[0] = s.Mode
+	}
+	if len(s.Services) > 0 {
+		parts = append(parts, "сервисы: "+groupTitles(s.Services))
+	}
+	if len(s.Domains) > 0 {
+		parts = append(parts, fmt.Sprintf("своих сайтов: %d", len(s.Domains)))
+	}
+	if s.Games.Mode != zapretfmt.ModeDisabled {
+		parts = append(parts, "игры: "+s.Games.String())
+	}
+	l := statusLine{"охват", strings.Join(parts, "; "), moodNone}
+	if len(s.Unfixable) > 0 {
+		l.text += "; не помогает: " + groupTitles(s.Unfixable)
+		l.mood = moodWarn
+	}
+	return l
 }
 
 // ---------- пункты ----------
@@ -170,7 +220,8 @@ func buildMenu(v menuView) []menuItem {
 	}
 	if v.installed() {
 		items = append(items,
-			menuItem{"Проверить Discord и YouTube", actCommand("check")},
+			menuItem{"Проверить, что открывается", actCommand("check")},
+			menuItem{"Что разблокировать: сервисы, свои сайты, все сайты, игры", actSites},
 			menuItem{"Подобрать лучшую стратегию", actSelect},
 			menuItem{"Выбрать стратегию вручную", actUse},
 		)
@@ -237,8 +288,8 @@ func (m *menu) install() {
 
 func actSelect(m *menu) bool {
 	m.say("Программа по очереди попробует все стратегии и поставит ту, при которой")
-	m.say("лучше всего открываются Discord и YouTube. Это займёт несколько минут; пока")
-	m.say("идёт подбор, связь с ними будет пропадать. Прервать — Ctrl+C.")
+	m.say("лучше всего открываются Discord, YouTube и включённые сайты. Это займёт")
+	m.say("несколько минут; пока идёт подбор, связь с ними будет пропадать. Прервать — Ctrl+C.")
 	if !m.confirm() {
 		return false
 	}
@@ -319,6 +370,203 @@ func actUninstall(m *menu) bool {
 	}
 	m.exec("uninstall", args)
 	return true
+}
+
+// ---------- что разблокировать ----------
+
+func actSites(m *menu) bool {
+	s := m.view.Sites
+	m.say("Что разблокирует zapret сейчас:\n")
+	for _, l := range s.lines() {
+		m.say("  " + l)
+	}
+	m.say("")
+	m.say("  1. Сервисы: включить или выключить (Instagram, X, Roblox…)")
+	m.say("  2. Добавить свой сайт")
+	m.say("  3. Убрать свой сайт")
+	m.say("  4. Режим: все сайты / по спискам / только домены")
+	m.say("  5. Игры (game filter)")
+	m.say("  6. Исключения: сайт сломался из-за zapret")
+	m.say("  7. Включить всё: все сервисы каталога и режим «все сайты»")
+	m.say("  0. Назад")
+	answer, ok := m.ask("\nВыберите пункт: ")
+	if !ok {
+		return false
+	}
+	switch answer {
+	case "1":
+		return actSitesServices(m)
+	case "2":
+		d, ok := m.ask("Адрес сайта, например example.com (Enter — назад): ")
+		if !ok || d == "" {
+			return false
+		}
+		m.exec("sites", []string{"add", d})
+	case "3":
+		d, ok := m.pick("Свои сайты", s.Domains)
+		if !ok {
+			return false
+		}
+		m.exec("sites", []string{"remove", d})
+	case "4":
+		return actSitesMode(m)
+	case "5":
+		return actSitesGames(m)
+	case "6":
+		return actSitesExclude(m)
+	case "7":
+		m.say("Включатся все сервисы каталога, и zapret будет обрабатывать соединения со")
+		m.say("всеми сайтами, кроме исключений (ya.ru, vk.com, банки и т.п. из списков Flowseal).")
+		m.say("Если какой-то сайт перестанет открываться — добавьте его в исключения (пункт 6).")
+		m.say("Сторож проверит всё и подберёт стратегию; что zapret открыть не может, он")
+		m.say("покажет как «не помогает» и чинить не будет.")
+		if !m.confirm() {
+			return false
+		}
+		if m.exec("sites", []string{"add", "all"}) == 0 {
+			m.exec("sites", []string{"mode", "all"})
+		}
+	default:
+		return false
+	}
+	return true
+}
+
+func actSitesServices(m *menu) bool {
+	s := m.view.Sites
+	m.say("Сервисы ([✓] — включён):\n")
+	for i, svc := range siteCatalog {
+		mark := "[ ]"
+		if s.serviceEnabled(svc.ID) {
+			mark = "[✓]"
+		}
+		line := fmt.Sprintf("  %d. %s %s", i+1, mark, svc.Name)
+		if svc.Note != "" {
+			line += " — " + svc.Note
+		}
+		m.say(line)
+	}
+	answer, ok := m.ask("\nНомера сервисов через пробел — включить выключенные и выключить включённые (Enter — назад): ")
+	if !ok || answer == "" {
+		return false
+	}
+	var add, remove []string
+	for f := range strings.FieldsFuncSeq(answer, func(r rune) bool { return r == ' ' || r == ',' }) {
+		n, err := strconv.Atoi(f)
+		if err != nil || n < 1 || n > len(siteCatalog) {
+			m.say("Нет сервиса с номером «%s».", f)
+			return true
+		}
+		id := siteCatalog[n-1].ID
+		if s.serviceEnabled(id) {
+			remove = appendUnique(remove, id)
+		} else {
+			add = appendUnique(add, id)
+		}
+	}
+	if len(add) > 0 {
+		m.exec("sites", append([]string{"add"}, add...))
+	}
+	if len(remove) > 0 {
+		m.exec("sites", append([]string{"remove"}, remove...))
+	}
+	return true
+}
+
+func actSitesMode(m *menu) bool {
+	options := []struct{ word, mode, title string }{
+		{"all", zapretfmt.IpsetAny, "Все сайты — zapret обрабатывает всё, кроме исключений. Больше всего открывается, но изредка ломает отдельные сайты"},
+		{"lists", zapretfmt.IpsetLoaded, "По спискам — домены из списков и подсети зарубежных хостингов (как в Flowseal по умолчанию)"},
+		{"domains", zapretfmt.IpsetNone, "Только домены из списков — если подсети хостингов что-то ломают"},
+	}
+	for i, o := range options {
+		mark := "  "
+		if o.mode == m.view.Sites.Mode {
+			mark = "→ "
+		}
+		m.say("%s%d. %s", mark, i+1, o.title)
+	}
+	answer, ok := m.ask("\nВыберите режим (Enter — назад): ")
+	n, err := strconv.Atoi(answer)
+	if !ok || err != nil || n < 1 || n > len(options) {
+		return false
+	}
+	m.exec("sites", []string{"mode", options[n-1].word})
+	return true
+}
+
+func actSitesGames(m *menu) bool {
+	m.say("Игры: zapret обрабатывает порты 1024-65535 для подсетей из ipset (в режиме «все сайты» —")
+	m.say("для всех адресов). Включайте, если игра не подключается; если что-то стало хуже — выключите.\n")
+	options := []struct{ word, mode, title string }{
+		{"off", zapretfmt.ModeDisabled, "Выключить"},
+		{"all", zapretfmt.ModeAll, "TCP и UDP"},
+		{"tcp", zapretfmt.ModeTCP, "Только TCP"},
+		{"udp", zapretfmt.ModeUDP, "Только UDP"},
+	}
+	for i, o := range options {
+		mark := "  "
+		if o.mode == m.view.Sites.Games.Mode {
+			mark = "→ "
+		}
+		m.say("%s%d. %s", mark, i+1, o.title)
+	}
+	answer, ok := m.ask("\nВыберите (Enter — назад): ")
+	n, err := strconv.Atoi(answer)
+	if !ok || err != nil || n < 1 || n > len(options) {
+		return false
+	}
+	m.exec("sites", []string{"games", options[n-1].word})
+	return true
+}
+
+func actSitesExclude(m *menu) bool {
+	ex := m.view.Sites.Excluded
+	if len(ex) > 0 {
+		m.say("Сейчас в исключениях: %s\n", strings.Join(ex, ", "))
+	}
+	m.say("  1. Добавить сайт в исключения (zapret его не трогает)")
+	m.say("  2. Убрать сайт из исключений")
+	m.say("  0. Назад")
+	answer, ok := m.ask("\nВыберите пункт: ")
+	if !ok {
+		return false
+	}
+	switch answer {
+	case "1":
+		d, ok := m.ask("Адрес сайта, например bank.example (Enter — назад): ")
+		if !ok || d == "" {
+			return false
+		}
+		m.exec("sites", []string{"exclude", d})
+	case "2":
+		d, ok := m.pick("Исключения", ex)
+		if !ok {
+			return false
+		}
+		m.exec("sites", []string{"include", d})
+	default:
+		return false
+	}
+	return true
+}
+
+// pick показывает нумерованный список и возвращает выбранный элемент.
+func (m *menu) pick(title string, items []string) (string, bool) {
+	if len(items) == 0 {
+		m.say("%s: пусто.", title)
+		return "", false
+	}
+	m.say("%s:\n", title)
+	for i, it := range items {
+		m.say("  %d. %s", i+1, it)
+	}
+	answer, ok := m.ask("\nНомер (Enter — назад): ")
+	n, err := strconv.Atoi(answer)
+	if !ok || err != nil || n < 1 || n > len(items) {
+		return "", false
+	}
+	return items[n-1], true
 }
 
 // ---------- цикл ----------

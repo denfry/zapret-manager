@@ -79,6 +79,8 @@ jobs:
             @{ pkg = "./internal/hostsfile"; fn = "FuzzMerge" },
             @{ pkg = "./internal/hostsfile"; fn = "FuzzParseUpstream" },
             @{ pkg = "./internal/safezip";   fn = "FuzzEntryPath" },
+            @{ pkg = "./internal/sitelist";  fn = "FuzzRender" },
+            @{ pkg = "./internal/sitelist";  fn = "FuzzNormalizeDomain" },
             @{ pkg = "./internal/version";   fn = "FuzzCompare" },
             @{ pkg = "./internal/zapretfmt"; fn = "FuzzParseGameFilter" }
           )

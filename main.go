@@ -23,7 +23,7 @@ import (
 
 // appVersion — версия программы; сборка релиза подставляет номер из тега:
 // -ldflags "-X main.appVersion=1.2.3".
-var appVersion = "1.1.0"
+var appVersion = "1.2.0"
 
 const (
 	managerSvcName = "zapret-manager"
@@ -45,7 +45,9 @@ func init() {
 		{"menu", false, "menu — меню по пунктам (открывается и двойным щелчком по exe)", cmdMenu},
 		{"install", true, "install [--strategy ИМЯ] [--from ПАПКА] [--select] — поставить в C:\\zapret, перенести текущую установку, включить службу-сторож", cmdInstall},
 		{"status", false, "status — что стоит и как работает", cmdStatus},
-		{"check", false, "check — проверить Discord и YouTube прямо сейчас", cmdCheck},
+		{"check", false, "check [-v] — проверить прямо сейчас, открываются ли Discord, YouTube и включённые сайты", cmdCheck},
+		// admin=false: показать может любой, а add/remove/mode/… сами просят права (cmdSites)
+		{"sites", false, "sites [add|remove|mode|games|exclude|include …] — что разблокировать: сервисы, свои сайты, все сайты, игры", cmdSites},
 		{"select", true, "select [--quick] [--dry-run] — перебрать стратегии и поставить лучшую", cmdSelect},
 		{"use", true, "use ИМЯ — поставить стратегию вручную (например: use ALT11)", cmdUse},
 		{"list", false, "list — стратегии и результаты последнего подбора", cmdList},
@@ -431,12 +433,10 @@ func cmdStatus(_ context.Context, a *App, _ []string) int {
 			fmt.Printf("пауза:           до %s\n", st.PausedUntil.Format("02.01 15:04"))
 		}
 	}
-	mode := ipsetMode(relDir)
-	ipsetInfo := mode
-	if mode == "loaded" {
-		ipsetInfo += fmt.Sprintf(" (%d подсетей)", countIpsetLines(relDir))
+	fmt.Println("\nчто разблокирует (подробно — zapret-manager sites):")
+	for _, l := range a.readSitesView(relDir).lines() {
+		fmt.Println("  " + l)
 	}
-	fmt.Printf("game filter:     %s\nipset:           %s\n", readGameFilter(relDir), ipsetInfo)
 
 	if c := st.LastCheck; c != nil {
 		verdict := "всё открывается"
@@ -523,6 +523,9 @@ func printReportV(rep *HealthReport, verbose bool) {
 			info = kindText(r)
 			if verbose && r.Detail != "" {
 				info += " — " + r.Detail
+			}
+			if rep.Skipped[r.Group] {
+				info += " (ни одна стратегия не открыла — сторож это не чинит)"
 			}
 		}
 		fmt.Printf("  %s %-20s %s\n", mark, r.Name, info)

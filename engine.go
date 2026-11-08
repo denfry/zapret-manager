@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -19,7 +20,7 @@ import (
 
 var (
 	errNetworkDown  = errors.New("пропал интернет (контрольные ya.ru и vk.com тоже не открываются)")
-	errNothingWorks = errors.New("ни одна стратегия не открыла Discord и YouTube")
+	errNothingWorks = errors.New("ни одна стратегия не открыла ни одного сайта из проверки")
 )
 
 // currentInstall: какая папка релиза и стратегия стоят сейчас. Источник правды —
@@ -111,16 +112,28 @@ func (a *App) applyStrategy(relDir, name string) error {
 // ---------- подбор ----------
 
 type RankEntry struct {
-	Strategy  string   `json:"strategy"`
-	Score     int      `json:"score"`
-	Max       int      `json:"max"`
-	Discord   string   `json:"discord"`
-	YouTube   string   `json:"youtube"`
-	Other     string   `json:"other,omitempty"`
-	LatencyMs int64    `json:"latency_ms"`
-	Healthy   bool     `json:"healthy"`
-	Fails     []string `json:"fails,omitempty"`
-	Error     string   `json:"error,omitempty"`
+	Strategy string `json:"strategy"`
+	Score    int    `json:"score"`
+	Max      int    `json:"max"`
+	Discord  string `json:"discord"`
+	YouTube  string `json:"youtube"`
+	Other    string `json:"other,omitempty"`
+	// Groups — по группам (без control): из них пересчитывается Healthy, когда
+	// подбор решает, какие группы zapret не открывает (unfixableGroups).
+	Groups    map[string]GroupStat `json:"groups,omitempty"`
+	LatencyMs int64                `json:"latency_ms"`
+	Healthy   bool                 `json:"healthy"`
+	Fails     []string             `json:"fails,omitempty"`
+	Error     string               `json:"error,omitempty"`
+}
+
+// groupsText — «Discord 6/6, YouTube 4/4, Instagram 2/2» для журнала.
+func (e RankEntry) groupsText() string {
+	s := "Discord " + e.Discord + ", YouTube " + e.YouTube
+	if e.Other != "" {
+		s += ", " + e.Other
+	}
+	return s
 }
 
 func (e RankEntry) Line() string {
@@ -146,9 +159,75 @@ func (e *RankEntry) fill(rep *HealthReport) {
 	e.Discord = rep.group("discord").String()
 	e.YouTube = rep.group("youtube").String()
 	e.Other = rep.otherGroups()
+	e.Groups = map[string]GroupStat{}
+	for name, g := range rep.Groups {
+		if name != "control" {
+			e.Groups[name] = *g
+		}
+	}
 	e.LatencyMs = rep.LatencyMs
 	e.Healthy = rep.Healthy
 	e.Fails = rep.failures()
+}
+
+// rehealth пересчитывает Healthy с другим набором пропускаемых групп.
+func (e *RankEntry) rehealth(ratio float64, skip map[string]bool) {
+	if e.Error != "" || e.Groups == nil {
+		return
+	}
+	e.Healthy = true
+	for name, g := range e.Groups {
+		if !groupHealthy(name, g, ratio, skip) {
+			e.Healthy = false
+		}
+	}
+	e.Other = otherGroupsText(e.Groups, skip)
+}
+
+// unfixableGroups — группы (кроме Discord, YouTube и control), которые на полном
+// подборе ни одна стратегия не открыла до порога ratio. Значит, их режут не DPI
+// (блокировка по IP, подмена DNS) или лежит сам сервис — смена стратегии не поможет,
+// и подбирать её снова и снова ради них нельзя: Discord и YouTube будут мигать.
+func unfixableGroups(entries []RankEntry, ratio float64) map[string]bool {
+	best := map[string]float64{}
+	for _, e := range entries {
+		if e.Error != "" {
+			continue
+		}
+		for name, g := range e.Groups {
+			if coreGroup(name) || g.Total == 0 {
+				continue
+			}
+			best[name] = max(best[name], float64(g.OK)/float64(g.Total))
+		}
+	}
+	out := map[string]bool{}
+	for name, r := range best {
+		if r < ratio-1e-9 {
+			out[name] = true
+		}
+	}
+	return out
+}
+
+// unfixableTTL — сколько не чинить группу, которую не открыла ни одна стратегия.
+// Потом подбор повторится: блокировки меняются.
+const unfixableTTL = 24 * time.Hour
+
+// skippedGroups — группы из последнего полного подбора, моложе unfixableTTL.
+// Discord и YouTube сюда не попадают никогда.
+func (a *App) skippedGroups() map[string]bool {
+	sw := a.loadState().LastSweep
+	if sw == nil || time.Since(sw.Time) > unfixableTTL {
+		return nil
+	}
+	skip := map[string]bool{}
+	for _, name := range sw.Unfixable {
+		if !coreGroup(name) {
+			skip[name] = true
+		}
+	}
+	return skip
 }
 
 func sortRanking(r []RankEntry, current string) {
@@ -187,7 +266,7 @@ func (a *App) testStrategy(ctx context.Context, relDir string, s Strategy, gf za
 		e.Error = err.Error()
 		return e, nil //nolint:nilerr // strategy error is recorded in the ranking
 	}
-	rep := runHealth(ctx, a.targets(), a.Cfg.HealthyRatio, sweepTimeout)
+	rep := runHealth(ctx, a.targetsFor(relDir), a.Cfg.HealthyRatio, sweepTimeout, nil)
 	p.Stop()
 	if err := ctx.Err(); err != nil {
 		return e, err
@@ -213,21 +292,32 @@ func (a *App) testStrategyRetry(ctx context.Context, relDir string, s Strategy, 
 // sweep по очереди запускает winws с каждой стратегией и проверяет адреса — как
 // «Run Tests → Standard» в service.bat. Тройку лучших перепроверяет и берёт худший
 // из двух замеров, чтобы случайная удача не решала.
-func (a *App) sweep(ctx context.Context, relDir string, list []Strategy, current string, progress func(string)) ([]RankEntry, error) {
+//
+// skip — группы, которые не влияют на Healthy. full — полный перебор: тогда skip
+// пересчитывается по его итогам (unfixableGroups) и возвращается вторым значением.
+func (a *App) sweep(ctx context.Context, relDir string, list []Strategy, current string, skip map[string]bool, full bool, progress func(string)) ([]RankEntry, map[string]bool, error) {
 	gf := readGameFilter(relDir)
 	if err := ensureUserLists(relDir); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	ratio := a.Cfg.HealthyRatio
 	byName := map[string]Strategy{}
 	entries := make([]RankEntry, 0, len(list))
 	for i, s := range list {
 		byName[s.Name] = s
 		e, err := a.testStrategyRetry(ctx, relDir, s, gf)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		e.rehealth(ratio, skip)
 		entries = append(entries, e)
 		progress(fmt.Sprintf("  [%2d/%d] %s", i+1, len(list), e.Line()))
+	}
+	if full {
+		skip = unfixableGroups(entries, ratio)
+		for i := range entries {
+			entries[i].rehealth(ratio, skip)
+		}
 	}
 	sortRanking(entries, current)
 	if len(entries) > 1 {
@@ -237,8 +327,9 @@ func (a *App) sweep(ctx context.Context, relDir string, list []Strategy, current
 			}
 			e2, err := a.testStrategyRetry(ctx, relDir, byName[entries[i].Strategy], gf)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
+			e2.rehealth(ratio, skip)
 			if e2.Error == "" && (e2.Score < entries[i].Score || (e2.Score == entries[i].Score && !e2.Healthy)) {
 				entries[i] = e2
 			} else if e2.Error == "" {
@@ -248,7 +339,7 @@ func (a *App) sweep(ctx context.Context, relDir string, list []Strategy, current
 		}
 		sortRanking(entries, current)
 	}
-	return entries, nil
+	return entries, skip, nil
 }
 
 type selectOpts struct {
@@ -313,11 +404,12 @@ func (a *App) selectStrategy(ctx context.Context, relDir, current string, o sele
 		}
 	}()
 
+	skip := a.skippedGroups()
 	var ranking []RankEntry
 	if o.quick {
 		if cands := a.quickCandidates(relDir, current, all); len(cands) > 1 {
 			o.progress(fmt.Sprintf("быстрая проверка %d лучших стратегий из прошлого подбора…", len(cands)))
-			r, err := a.sweep(ctx, relDir, cands, current, o.progress)
+			r, _, err := a.sweep(ctx, relDir, cands, current, skip, false, o.progress)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -329,15 +421,20 @@ func (a *App) selectStrategy(ctx context.Context, relDir, current string, o sele
 		}
 	}
 	if ranking == nil {
-		o.progress(fmt.Sprintf("перебираю %d стратегий (Discord и YouTube на пару минут будут мигать)…", len(all)))
-		r, err := a.sweep(ctx, relDir, all, current, o.progress)
+		o.progress(fmt.Sprintf("перебираю %d стратегий (пока идёт подбор, сайты будут то открываться, то нет)…", len(all)))
+		r, unfixable, err := a.sweep(ctx, relDir, all, current, skip, true, o.progress)
 		if err != nil {
 			return nil, nil, err
 		}
 		ranking = r
+		names := slices.Sorted(maps.Keys(unfixable))
+		for _, name := range names {
+			a.Log.Eventf("%s не открывается ни с одной стратегией: его режут не DPI (по IP, подменой DNS) или он недоступен сам — zapret тут не поможет. Сторож перепроверит через сутки",
+				groupTitle(name))
+		}
 		ver := releaseVersion(relDir)
 		a.updateState(func(st *State) {
-			st.LastSweep = &SweepSummary{Time: time.Now(), Version: ver, Dir: relDir, Ranking: r}
+			st.LastSweep = &SweepSummary{Time: time.Now(), Version: ver, Dir: relDir, Ranking: r, Unfixable: names}
 		})
 	}
 	best := ranking[0]
@@ -357,8 +454,8 @@ func (a *App) selectStrategy(ctx context.Context, relDir, current string, o sele
 // ---------- проверка и починка ----------
 
 func (a *App) checkNow(ctx context.Context) *HealthReport {
-	rep := runHealth(ctx, a.targets(), a.Cfg.HealthyRatio, checkTimeout)
-	_, strategy := a.currentInstall()
+	relDir, strategy := a.currentInstall()
+	rep := runHealth(ctx, a.targetsFor(relDir), a.Cfg.HealthyRatio, checkTimeout, a.skippedGroups())
 	a.updateState(func(st *State) { st.LastCheck = rep.summary(strategy) })
 	return rep
 }
@@ -372,7 +469,7 @@ func (a *App) heal(ctx context.Context, rep *HealthReport) {
 	st := a.loadState()
 	if rep.DNSProblem {
 		if time.Since(st.LastDNSWarn) > time.Hour {
-			a.Log.Eventf("Discord/YouTube не открываются из-за DNS: %s. Смена стратегии не поможет — включите DNS-over-HTTPS (Windows: Параметры → Сеть → DNS)",
+			a.Log.Eventf("сайты не открываются из-за DNS: %s. Смена стратегии не поможет — включите DNS-over-HTTPS (Windows: Параметры → Сеть → DNS)",
 				strings.Join(rep.failures(), "; "))
 			a.updateState(func(s *State) { s.LastDNSWarn = time.Now() })
 		}
@@ -391,7 +488,8 @@ func (a *App) heal(ctx context.Context, rep *HealthReport) {
 		a.Log.Eventf("после перезапуска заработало (%s)", r2.shortText())
 		return
 	}
-	// если подборы подряд ничего не находят (например, лёг сам Discord), реже дёргаем сеть:
+	// если подборы подряд ничего не находят (например, лёг сам Discord), реже дёргаем сеть
+	// (сервисы, которые zapret не открывает вовсе, сюда не доходят — см. skippedGroups):
 	// 30 мин → 1 ч → 2 ч → 4 ч
 	minGap := time.Duration(a.Cfg.MinSweepIntervalMin) * time.Minute << min(st.HealStreak, 3)
 	if since := time.Since(st.LastHeal); since < minGap {
@@ -410,9 +508,9 @@ func (a *App) heal(ctx context.Context, rep *HealthReport) {
 		return
 	default:
 		if !strings.EqualFold(best.Strategy, strategy) {
-			a.Log.Eventf("стратегия сменена: %s → %s (Discord %s, YouTube %s)", strategy, best.Strategy, best.Discord, best.YouTube)
+			a.Log.Eventf("стратегия сменена: %s → %s (%s)", strategy, best.Strategy, best.groupsText())
 		} else {
-			a.Log.Eventf("текущая стратегия %s по-прежнему лучшая (Discord %s, YouTube %s)", best.Strategy, best.Discord, best.YouTube)
+			a.Log.Eventf("текущая стратегия %s по-прежнему лучшая (%s)", best.Strategy, best.groupsText())
 		}
 		healed = best.Healthy
 	}
@@ -494,7 +592,7 @@ func (a *App) updateRelease(ctx context.Context, force bool) error {
 
 	var base *HealthReport
 	if queryService(zapretSvcName).State == svc.Running {
-		base = runHealth(ctx, a.targets(), a.Cfg.HealthyRatio, checkTimeout)
+		base = runHealth(ctx, a.targetsFor(relDir), a.Cfg.HealthyRatio, checkTimeout, a.skippedGroups())
 	}
 	var rep *HealthReport
 	if _, ferr := a.findStrategy(newDir, strategy); ferr == nil {
@@ -502,7 +600,7 @@ func (a *App) updateRelease(ctx context.Context, force bool) error {
 			a.Log.Warnf("стратегия %s в новой версии не запустилась: %v", strategy, err)
 		} else {
 			_ = sleepCtx(ctx, 2*time.Second)
-			rep = runHealth(ctx, a.targets(), a.Cfg.HealthyRatio, checkTimeout)
+			rep = runHealth(ctx, a.targetsFor(newDir), a.Cfg.HealthyRatio, checkTimeout, a.skippedGroups())
 		}
 	} else {
 		a.Log.Infof("в новой версии нет стратегии %s", strategy)
@@ -510,7 +608,7 @@ func (a *App) updateRelease(ctx context.Context, force bool) error {
 	if rep == nil || !rep.Healthy {
 		a.Log.Infof("подбираю стратегию в новой версии…")
 		if _, _, err := a.selectStrategy(ctx, newDir, strategy, selectOpts{apply: true}); err == nil {
-			rep = runHealth(ctx, a.targets(), a.Cfg.HealthyRatio, checkTimeout)
+			rep = runHealth(ctx, a.targetsFor(newDir), a.Cfg.HealthyRatio, checkTimeout, a.skippedGroups())
 		} else if !errors.Is(err, errNothingWorks) {
 			a.Log.Warnf("подбор: %v", err)
 		}
@@ -574,6 +672,13 @@ func (a *App) updateAll(ctx context.Context, manual, force bool) {
 			a.Log.Eventf("обновлены списки из main: %s", strings.Join(changed, ", "))
 		} else if err == nil {
 			a.Log.Infof("списки доменов актуальны")
+		}
+	}
+	if relDir != "" {
+		if names, err := syncCatalog(relDir); err != nil {
+			a.Log.Warnf("сервисы из каталога: %v", err)
+		} else if len(names) > 0 {
+			a.Log.Eventf("обновлены домены сервисов: %s", strings.Join(names, ", "))
 		}
 	}
 	if a.Cfg.UpdateHosts {

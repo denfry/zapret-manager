@@ -1,0 +1,2 @@
+go test fuzz v1
+string("# >>> zapret-manager: сервисы из каталога (меняются командой zapret-manager sites) >>>0# >>> zapret-manager: сервисы из каталога (меняются командой zapret-manager sites) >>>0")

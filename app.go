@@ -22,12 +22,12 @@ import (
 // zapret (game filter, режим ipset, *-user.txt) живут в папке релиза в тех же
 // файлах, что читает service.bat, чтобы его меню продолжало работать.
 type Config struct {
-	AutoHeal            bool     `json:"auto_heal"`              // сам перезапускать / подбирать стратегию, когда Discord или YouTube отвалились
+	AutoHeal            bool     `json:"auto_heal"`              // сам перезапускать / подбирать стратегию, когда Discord, YouTube или включённые сайты отвалились
 	AutoUpdate          bool     `json:"auto_update"`            // сам ставить новые релизы Flowseal
 	UpdateIpset         bool     `json:"update_ipset"`           // обновлять ipset-all.txt из .service/ipset-service.txt
 	UpdateListsFromMain bool     `json:"update_lists_from_main"` // подтягивать list-*.txt из ветки main между релизами
 	UpdateHosts         bool     `json:"update_hosts"`           // держать в hosts актуальный блок из .service/hosts
-	CheckIntervalSec    int      `json:"check_interval_sec"`     // как часто проверять Discord и YouTube
+	CheckIntervalSec    int      `json:"check_interval_sec"`     // как часто проверять, что всё открывается
 	UpdateIntervalHours int      `json:"update_interval_hours"`  // как часто проверять обновления
 	MinSweepIntervalMin int      `json:"min_sweep_interval_min"` // не чаще одного полного подбора за это время
 	FailuresBeforeHeal  int      `json:"failures_before_heal"`   // сколько проверок подряд должно провалиться
@@ -147,15 +147,17 @@ type State struct {
 }
 
 type CheckSummary struct {
-	Time        time.Time `json:"time"`
-	Strategy    string    `json:"strategy"`
-	Discord     string    `json:"discord"`
-	YouTube     string    `json:"youtube"`
-	Other       string    `json:"other,omitempty"`
-	Healthy     bool      `json:"healthy"`
-	NetworkDown bool      `json:"network_down"`
-	DNSProblem  bool      `json:"dns_problem"`
-	Failures    []string  `json:"failures,omitempty"`
+	Time        time.Time            `json:"time"`
+	Strategy    string               `json:"strategy"`
+	Discord     string               `json:"discord"`
+	YouTube     string               `json:"youtube"`
+	Other       string               `json:"other,omitempty"`
+	Groups      map[string]GroupStat `json:"groups,omitempty"`  // всё, кроме Discord/YouTube/control: сервисы, свои сайты
+	Skipped     []string             `json:"skipped,omitempty"` // группы, которые zapret не открывает
+	Healthy     bool                 `json:"healthy"`
+	NetworkDown bool                 `json:"network_down"`
+	DNSProblem  bool                 `json:"dns_problem"`
+	Failures    []string             `json:"failures,omitempty"`
 }
 
 type SweepSummary struct {
@@ -163,6 +165,9 @@ type SweepSummary struct {
 	Version string      `json:"version"`
 	Dir     string      `json:"dir"`
 	Ranking []RankEntry `json:"ranking"`
+	// Unfixable — группы, которые на этом подборе не открыла ни одна стратегия.
+	// Сутки после подбора сторож их не чинит (App.skippedGroups).
+	Unfixable []string `json:"unfixable,omitempty"`
 }
 
 // App — корневая папка, конфиг и лог одного процесса (консольной команды или службы).

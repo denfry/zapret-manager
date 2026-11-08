@@ -63,3 +63,44 @@ func TestAppendUnique(t *testing.T) {
 		t.Fatal(l)
 	}
 }
+
+func entry(name string, groups map[string]GroupStat) RankEntry {
+	return RankEntry{Strategy: name, Groups: groups}
+}
+
+func TestUnfixableGroups(t *testing.T) {
+	entries := []RankEntry{
+		entry("A", map[string]GroupStat{"discord": {0, 6}, "instagram": {0, 2}, "x": {1, 2}, "site.example": {0, 1}}),
+		entry("B", map[string]GroupStat{"discord": {0, 6}, "instagram": {0, 2}, "x": {2, 2}, "site.example": {0, 1}}),
+		{Strategy: "broken", Error: "не стартует", Groups: map[string]GroupStat{"site.example": {1, 1}}},
+	}
+	got := unfixableGroups(entries, 0.75)
+	// x открыла стратегия B; Discord не пропускается никогда; стратегия с ошибкой не в счёт
+	if len(got) != 2 || !got["instagram"] || !got["site.example"] {
+		t.Fatalf("%v", got)
+	}
+	if len(unfixableGroups(entries[2:], 0.75)) != 0 {
+		t.Fatal("одни ошибки — судить не по чему")
+	}
+}
+
+func TestRehealth(t *testing.T) {
+	e := entry("A", map[string]GroupStat{"discord": {6, 6}, "youtube": {4, 4}, "instagram": {0, 2}})
+	e.rehealth(0.75, nil)
+	if e.Healthy {
+		t.Fatal("Instagram не открылся — нездоров")
+	}
+	e.rehealth(0.75, map[string]bool{"instagram": true})
+	if !e.Healthy || e.Other != "Instagram 0/2 (zapret не помогает)" {
+		t.Fatalf("%+v", e)
+	}
+	bad := RankEntry{Strategy: "x", Error: "boom"}
+	bad.rehealth(0.75, nil)
+	if bad.Healthy {
+		t.Fatal("стратегия с ошибкой здоровой не становится")
+	}
+	e.Discord, e.YouTube = "6/6", "4/4" // их заполняет fill()
+	if s := e.groupsText(); s != "Discord 6/6, YouTube 4/4, Instagram 0/2 (zapret не помогает)" {
+		t.Fatalf("groupsText: %q", s)
+	}
+}

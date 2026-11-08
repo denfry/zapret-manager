@@ -188,7 +188,7 @@ func (a *App) ensureRunning() {
 	})
 }
 
-// periodicCheck проверяет Discord/YouTube и при подтверждённой поломке лечит.
+// periodicCheck проверяет Discord, YouTube и включённые сайты и при подтверждённой поломке лечит.
 // Возвращает, через сколько проверять снова.
 func (a *App) periodicCheck(ctx context.Context, fails *int) time.Duration {
 	delay := time.Duration(a.Cfg.CheckIntervalSec) * time.Second
@@ -250,7 +250,7 @@ func (a *App) periodicCheck(ctx context.Context, fails *int) time.Duration {
 		}
 		*fails = 0
 		if !a.Cfg.AutoHeal {
-			a.Log.Eventf("Discord/YouTube не работают (%s), автопочинка выключена в config.json", rep.shortText())
+			a.Log.Eventf("не всё открывается (%s), автопочинка выключена в config.json", rep.shortText())
 			return nil
 		}
 		a.heal(ctx, rep)

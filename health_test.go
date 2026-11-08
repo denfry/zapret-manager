@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -240,7 +241,7 @@ func TestSummarize(t *testing.T) {
 			false, false, false, 1, 2},
 	}
 	for _, c := range cases {
-		rep := summarize(c.results, 0.75)
+		rep := summarize(c.results, 0.75, nil)
 		if rep.Healthy != c.healthy || rep.NetworkDown != c.down || rep.DNSProblem != c.dns || rep.Score != c.score || rep.Max != c.max {
 			t.Errorf("%s: healthy=%v down=%v dns=%v score=%d/%d", c.name, rep.Healthy, rep.NetworkDown, rep.DNSProblem, rep.Score, rep.Max)
 		}
@@ -248,7 +249,7 @@ func TestSummarize(t *testing.T) {
 }
 
 func TestReportTexts(t *testing.T) {
-	rep := summarize([]CheckResult{res("discord", "ok"), res("youtube", "reset"), res("games", "ok"), res("control", "connect")}, 0.75)
+	rep := summarize([]CheckResult{res("discord", "ok"), res("youtube", "reset"), res("games", "ok"), res("control", "connect")}, 0.75, nil)
 	if s := rep.shortText(); s != "Discord 1/1, YouTube 0/1, games 1/1" {
 		t.Fatalf("shortText: %q", s)
 	}
@@ -293,5 +294,35 @@ func TestClassifyErr(t *testing.T) {
 		if got := classifyErr(c.err, c.phase); got != c.want {
 			t.Errorf("classifyErr(%v, %s) = %s, want %s", c.err, c.phase, got, c.want)
 		}
+	}
+}
+
+// Группа, которую не открывает ни одна стратегия, видна в отчёте, но не делает его
+// «нездоровым» и не превращает чужие сбои в «проблему DNS».
+func TestSummarizeSkip(t *testing.T) {
+	results := []CheckResult{
+		res("discord", "ok"), res("youtube", "ok"), res("control", "ok"),
+		res("instagram", "cert"), res("instagram", "dns"), res("x", "ok"),
+	}
+	if rep := summarize(results, 0.75, nil); rep.Healthy || !rep.DNSProblem {
+		t.Fatalf("без пропуска: healthy=%v dns=%v", rep.Healthy, rep.DNSProblem)
+	}
+	rep := summarize(results, 0.75, map[string]bool{"instagram": true})
+	if !rep.Healthy || rep.DNSProblem || rep.Score != 3 || rep.Max != 5 {
+		t.Fatalf("с пропуском: %+v", rep)
+	}
+	if f := rep.failures(); len(f) != 0 {
+		t.Fatalf("пропущенные группы — не неисправности: %v", f)
+	}
+	if o := rep.otherGroups(); o != "Instagram 0/2 (zapret не помогает), X (Twitter) 1/1" {
+		t.Fatalf("otherGroups: %q", o)
+	}
+	sum := rep.summary("ALT")
+	if !slices.Equal(sum.Skipped, []string{"instagram"}) || sum.Groups["x"] != (GroupStat{1, 1}) || len(sum.Groups) != 2 {
+		t.Fatalf("%+v", sum)
+	}
+	// Discord пропустить нельзя: skippedGroups его не отдаёт, но и здесь сбой Discord — сбой
+	if rep := summarize([]CheckResult{res("discord", "reset"), res("instagram", "reset")}, 0.75, map[string]bool{"instagram": true}); rep.Healthy {
+		t.Fatal("Discord не открылся — нездоров")
 	}
 }

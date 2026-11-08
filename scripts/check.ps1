@@ -49,6 +49,8 @@ if ($Fuzz -ne "0") {
         @("./internal/hostsfile", "FuzzMerge"),
         @("./internal/hostsfile", "FuzzParseUpstream"),
         @("./internal/safezip", "FuzzEntryPath"),
+        @("./internal/sitelist", "FuzzRender"),
+        @("./internal/sitelist", "FuzzNormalizeDomain"),
         @("./internal/version", "FuzzCompare"),
         @("./internal/zapretfmt", "FuzzParseGameFilter")
     )

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows/svc"
+
+	"zapret-manager/internal/zapretfmt"
 )
 
 var testNow = time.Date(2026, 11, 8, 14, 0, 0, 0, time.Local)
@@ -22,7 +24,12 @@ func viewRunning() menuView {
 		Root: `C:\zapret`, ReleaseDir: `C:\zapret\releases\1.10.4`, Version: "1.10.4", Strategy: "general (ALT11)",
 		ZapretExists: true, ZapretState: svc.Running, ManagerExists: true, ManagerState: svc.Running,
 		LastCheck: &CheckSummary{Time: testNow, Discord: "6/6", YouTube: "4/4", Healthy: true},
-		Now:       testNow,
+		Sites: sitesView{
+			Mode: zapretfmt.IpsetLoaded, Subnets: 33336, Builtin: 81,
+			Services: []string{"x"}, Domains: []string{"my.example"},
+			Games: zapretfmt.DisabledGameFilter(),
+		},
+		Now: testNow,
 	}
 }
 
@@ -152,6 +159,16 @@ func TestStatusLines(t *testing.T) {
 	broken.LastCheck = &CheckSummary{Time: testNow, Discord: "0/6", YouTube: "4/4"}
 	stopped := viewRunning()
 	stopped.ZapretState = svc.Stopped
+	withSites := viewRunning()
+	withSites.LastCheck = &CheckSummary{
+		Time: testNow, Discord: "6/6", YouTube: "4/4", Healthy: true,
+		Groups:  map[string]GroupStat{"x": {2, 2}, "my.example": {1, 1}, "instagram": {0, 2}},
+		Skipped: []string{"instagram"},
+	}
+	withSites.Sites.Unfixable = []string{"instagram"}
+	allSites := viewRunning()
+	allSites.Sites.Mode = zapretfmt.IpsetAny
+	allSites.Sites.Games = zapretfmt.GameFilter{Mode: zapretfmt.ModeAll, TCPRange: "1024-65535", UDPRange: "1024-65535"}
 
 	cases := []struct {
 		name  string
@@ -170,6 +187,11 @@ func TestStatusLines(t *testing.T) {
 		{"без сторожа", viewForeignZapret(), "автопочинка", "не установлена", moodWarn},
 		{"проверка", viewRunning(), "проверка", "Discord 6/6, YouTube 4/4 — всё открывается", moodOK},
 		{"проблемы", broken, "проверка", "есть проблемы", moodBad},
+		// пропущенные группы (их zapret не открывает) в сводке не участвуют
+		{"сайты в проверке", withSites, "проверка", "Discord 6/6, YouTube 4/4, остальное 3/3 — всё открывается", moodOK},
+		{"охват", viewRunning(), "охват", "по спискам; сервисы: X (Twitter); своих сайтов: 1", moodNone},
+		{"охват: не помогает", withSites, "охват", "не помогает: Instagram", moodWarn},
+		{"охват: всё", allSites, "охват", "все сайты; сервисы: X (Twitter); своих сайтов: 1; игры: TCP 1024-65535 и UDP 1024-65535", moodNone},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -252,6 +274,27 @@ func TestMenuDispatch(t *testing.T) {
 		{"пустой ввод перерисовывает", running, []string{"", "", "0"}, nil},
 		{"BOM в начале ввода", running, []string{string(rune(0xFEFF)) + key(t, running, "Проверить"), "", "0"}, []execCall{{"check", nil}}},
 		{"нет такого пункта", running, []string{"99", "abc", "0"}, nil},
+		// «Что разблокировать»: в тестовом виде включён только X (каталог: hosting, instagram, facebook, x…)
+		{"сайты: сервисы", running, []string{key(t, running, "Что разблокировать"), "1", "2 4, 3", "", "0"},
+			[]execCall{{"sites", []string{"add", "instagram", "facebook"}}, {"sites", []string{"remove", "x"}}}},
+		{"сайты: сервисы, не тот номер", running, []string{key(t, running, "Что разблокировать"), "1", "2 99", "", "0"}, nil},
+		{"сайты: сервисы, назад", running, []string{key(t, running, "Что разблокировать"), "1", "", "0"}, nil},
+		{"сайты: свой сайт", running, []string{key(t, running, "Что разблокировать"), "2", "https://example.com/", "", "0"},
+			[]execCall{{"sites", []string{"add", "https://example.com/"}}}},
+		{"сайты: убрать свой", running, []string{key(t, running, "Что разблокировать"), "3", "1", "", "0"},
+			[]execCall{{"sites", []string{"remove", "my.example"}}}},
+		{"сайты: режим", running, []string{key(t, running, "Что разблокировать"), "4", "1", "", "0"},
+			[]execCall{{"sites", []string{"mode", "all"}}}},
+		{"сайты: режим, назад", running, []string{key(t, running, "Что разблокировать"), "4", "", "0"}, nil},
+		{"сайты: игры", running, []string{key(t, running, "Что разблокировать"), "5", "2", "", "0"},
+			[]execCall{{"sites", []string{"games", "all"}}}},
+		{"сайты: исключение", running, []string{key(t, running, "Что разблокировать"), "6", "1", "bank.example", "", "0"},
+			[]execCall{{"sites", []string{"exclude", "bank.example"}}}},
+		{"сайты: исключений нет", running, []string{key(t, running, "Что разблокировать"), "6", "2", "0"}, nil},
+		{"сайты: всё", running, []string{key(t, running, "Что разблокировать"), "7", "", "", "0"},
+			[]execCall{{"sites", []string{"add", "all"}}, {"sites", []string{"mode", "all"}}}},
+		{"сайты: всё, отмена", running, []string{key(t, running, "Что разблокировать"), "7", "0", "0"}, nil},
+		{"сайты: назад", running, []string{key(t, running, "Что разблокировать"), "0", "0"}, nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -269,7 +312,7 @@ func TestMenuDispatch(t *testing.T) {
 // в вопросе про паузу значит «выключить без срока», но EOF — не пустая строка.
 func TestMenuEOFNeverRunsAction(t *testing.T) {
 	running := viewRunning()
-	for _, prefix := range []string{"Подобрать", "Выбрать", "Выключить", "Удалить"} {
+	for _, prefix := range []string{"Подобрать", "Выбрать", "Выключить", "Удалить", "Что разблокировать"} {
 		t.Run(prefix, func(t *testing.T) {
 			calls, out := runTestMenu(t, running, key(t, running, prefix)+"\n")
 			if len(calls) != 0 {

@@ -323,7 +323,7 @@ func installManagerService(exePath string) error {
 		}
 		s, err = m.CreateService(managerSvcName, exePath, mgr.Config{
 			DisplayName: "Zapret Manager",
-			Description: "Следит за zapret: обновляет релиз, ipset, hosts и сам меняет стратегию, когда Discord или YouTube отваливаются",
+			Description: "Следит за zapret: обновляет релиз, ipset, hosts и сам меняет стратегию, когда Discord, YouTube или включённые сайты перестают открываться",
 			StartType:   mgr.StartAutomatic,
 		}, "service")
 		if err != nil {
@@ -332,7 +332,7 @@ func installManagerService(exePath string) error {
 	}
 	defer s.Close()
 	if err := changeService(s, mgr.StartAutomatic, bin, "Zapret Manager",
-		"Следит за zapret: обновляет релиз, ipset, hosts и сам меняет стратегию, когда Discord или YouTube отваливаются"); err != nil {
+		"Следит за zapret: обновляет релиз, ipset, hosts и сам меняет стратегию, когда Discord, YouTube или включённые сайты перестают открываться"); err != nil {
 		return err
 	}
 	_ = s.SetRecoveryActions([]mgr.RecoveryAction{

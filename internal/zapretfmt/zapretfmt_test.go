@@ -132,5 +132,22 @@ func FuzzParseGameFilter(f *testing.F) {
 				t.Fatalf("unsafe value %q from %q", v, content)
 			}
 		}
+		// записанный файл читается обратно в то же значение
+		if back := ParseGameFilter(gf.FileContent()); back != gf {
+			t.Fatalf("round trip %q: %+v → %q → %+v", content, gf, gf.FileContent(), back)
+		}
 	})
+}
+
+func TestGameFilterFileContent(t *testing.T) {
+	gf := GameFilter{Mode: ModeTCP, TCPRange: "443,1024-65535", UDPRange: DefaultPortRange}
+	want := "mode=tcp\r\ntcp=443,1024-65535\r\nudp=1024-65535\r\n"
+	if got := gf.FileContent(); got != want {
+		t.Fatalf("%q", got)
+	}
+	// значения не из ParseGameFilter тоже не попадают в файл как есть
+	bad := GameFilter{Mode: "all --x", TCPRange: "1 & calc", UDPRange: ""}
+	if got := bad.FileContent(); got != "mode=disabled\r\ntcp=1024-65535\r\nudp=1024-65535\r\n" {
+		t.Fatalf("%q", got)
+	}
 }

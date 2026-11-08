@@ -8,8 +8,9 @@ Copilot, Gemini CLI, Aider и др.). `CLAUDE.md` импортирует это�
 
 Один exe для Windows: консольная утилита и служба-сторож для
 [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube).
-Ставит zapret в службу, обновляет релиз/ipset/списки/hosts, проверяет Discord и YouTube
-настоящими запросами и сам подбирает стратегию, когда они отваливаются.
+Ставит zapret в службу, обновляет релиз/ipset/списки/hosts, расширяет охват (сервисы из
+каталога, свои сайты, «все сайты», игры), проверяет всё это настоящими запросами и сам
+подбирает стратегию, когда что-то отваливается.
 
 - Go 1.26 (`toolchain go1.26.10` в go.mod), одна зависимость — `golang.org/x/sys`.
 - Только Windows (SCM, реестр, ACL, WinDivert). Сборка под другие ОС не поддерживается.
@@ -20,12 +21,13 @@ Copilot, Gemini CLI, Aider и др.). `CLAUDE.md` импортирует это�
 
 | Путь | Что там |
 |---|---|
-| `main.go` | CLI: таблица команд, install/status/check/select/use/list/update/hosts/off/on/doctor/log/uninstall |
+| `main.go` | CLI: таблица команд, install/status/check/sites/select/use/list/update/hosts/off/on/doctor/log/uninstall |
 | `menu.go` | меню для двойного клика: шапка состояния, пункты → те же команды из таблицы (своей логики нет) |
 | `app.go` | Config (+валидация), State (+межпроцессная блокировка), блокировки, лог, файловые помощники |
 | `engine.go` | бизнес-логика: текущая установка, смена стратегии с откатом, подбор, починка, обновление релиза |
 | `watchdog.go` | служба: цикл проверок, пауза, автозапуск zapret |
 | `health.go` | проверка адресов: TCP → TLS → HTTP, классификация сбоев, решение «здоров/нет сети/DNS» |
+| `sites.go` | что разблокировать: каталог сервисов, свои домены, режим ipset, game filter, команда `sites`, адреса проверки |
 | `release.go` | HTTP-загрузчик с повторами, версии, скачивание/распаковка релиза, ipset и списки |
 | `hosts.go` | запись hosts с копией в backups\ |
 | `strategy.go` | стратегии (`general*.bat`, `custom\*.bat`), сборка командной строки winws |
@@ -34,6 +36,7 @@ Copilot, Gemini CLI, Aider и др.). `CLAUDE.md` импортирует это�
 | `doctor.go` | диагностика конфликтов |
 | `internal/batch` | разбор .bat → аргументы winws (чистые функции, fuzz) |
 | `internal/hostsfile` | слияние блока hosts (идемпотентно, fuzz) |
+| `internal/sitelist` | блок сервисов в list-general-user.txt, свои домены, разбор ввода домена (fuzz) |
 | `internal/safezip` | безопасная распаковка zip (traversal, ADS, лимиты; fuzz) |
 | `internal/version` | версии релизов |
 | `internal/zapretfmt` | game filter, режимы ipset, проверка списков |
@@ -75,7 +78,11 @@ build.cmd                               # тесты + dist\zapret-manager.exe
 6. **Служба zapret никогда не остаётся со сломанной командной строкой** — `applyStrategy`
    откатывает binPath. У службы zapret нет recovery actions (они мешают подбору).
 7. **hosts:** копия в backups\ перед каждой записью; только блок между маркерами;
-   `hostsfile.Merge` идемпотентен — держи это свойство (есть fuzz-тест).
+   `hostsfile.Merge` идемпотентен — держи это свойство (есть fuzz-тест). То же для блока
+   сервисов в `list-general-user.txt` (`sitelist`): запись идемпотентна, чужие строки целы,
+   файл никогда не пустой.
+   Discord и YouTube сторож чинит всегда; прочие группы — пока подбор не показал, что их
+   не открывает ни одна стратегия (`unfixableGroups`, сутки).
 8. **Ошибки не глотаются молча.** `_ =` только для закрытия дескрипторов и best-effort
    операций с комментарием почему. Паника в стороже логируется со стеком — не добавляй
    `recover`, скрывающий причину.

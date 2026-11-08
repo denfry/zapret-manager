@@ -26,8 +26,9 @@ type Target struct {
 	Group string `json:"group"` // discord | youtube | control | любая своя группа
 }
 
-// defaultTargets: Discord и YouTube — то, что проверяем; ya.ru и vk.com есть в
+// defaultTargets: Discord и YouTube проверяются всегда; ya.ru и vk.com есть в
 // list-exclude, zapret их не трогает — по ним понимаем, что пропал сам интернет.
+// Включённые сервисы из каталога и свои сайты добавляет App.targetsFor (sites.go).
 func defaultTargets() []Target {
 	return []Target{
 		{"Discord", "https://discord.com/", "discord"},
@@ -43,13 +44,6 @@ func defaultTargets() []Target {
 		{"Яндекс (контроль)", "https://ya.ru/", "control"},
 		{"VK (контроль)", "https://vk.com/", "control"},
 	}
-}
-
-func (a *App) targets() []Target {
-	if len(a.Cfg.Targets) > 0 {
-		return a.Cfg.Targets
-	}
-	return defaultTargets()
 }
 
 const (
@@ -98,8 +92,21 @@ func kindText(r CheckResult) string {
 }
 
 type GroupStat struct {
-	OK    int
-	Total int
+	OK    int `json:"ok"`
+	Total int `json:"total"`
+}
+
+// coreGroup — группы, которые сторож чинит всегда: ради них zapret и ставят.
+// Остальные (сервисы из каталога, свои сайты, группы из config.json) он перестаёт
+// чинить, если подбор показал, что их не открывает ни одна стратегия (unfixableGroups).
+func coreGroup(name string) bool { return name == "discord" || name == "youtube" || name == "control" }
+
+// groupHealthy: группа открылась с долей ≥ ratio, или её решено не учитывать.
+func groupHealthy(name string, g GroupStat, ratio float64, skip map[string]bool) bool {
+	if name == "control" || g.Total == 0 || skip[name] {
+		return true
+	}
+	return float64(g.OK)/float64(g.Total) >= ratio-1e-9
 }
 
 func (g *GroupStat) String() string {
@@ -113,6 +120,7 @@ type HealthReport struct {
 	Time        time.Time
 	Results     []CheckResult
 	Groups      map[string]*GroupStat
+	Skipped     map[string]bool // группы, которые zapret не открывает ни одной стратегией: показываем, но не чиним
 	Score       int
 	Max         int
 	LatencyMs   int64
@@ -128,23 +136,37 @@ func (r *HealthReport) group(name string) *GroupStat {
 	return &GroupStat{}
 }
 
-// otherGroups — свои группы из config.json (не discord/youtube/control).
+// otherGroups — всё, кроме discord/youtube/control: сервисы из каталога, свои сайты,
+// группы из config.json.
 func (r *HealthReport) otherGroups() string {
-	var parts []string
+	stats := map[string]GroupStat{}
 	for name, g := range r.Groups {
-		if name == "discord" || name == "youtube" || name == "control" {
+		stats[name] = *g
+	}
+	return otherGroupsText(stats, r.Skipped)
+}
+
+func otherGroupsText(groups map[string]GroupStat, skip map[string]bool) string {
+	var parts []string
+	for name, g := range groups {
+		if coreGroup(name) {
 			continue
 		}
-		parts = append(parts, name+" "+g.String())
+		s := groupTitle(name) + " " + g.String()
+		if skip[name] && g.OK < g.Total {
+			s += " (zapret не помогает)"
+		}
+		parts = append(parts, s)
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, ", ")
 }
 
+// failures — что не открылось и что сторож будет чинить (без control и пропущенных групп).
 func (r *HealthReport) failures() []string {
 	var out []string
 	for _, res := range r.Results {
-		if !res.OK && res.Group != "control" {
+		if !res.OK && res.Group != "control" && !r.Skipped[res.Group] {
 			out = append(out, res.Name+": "+kindText(res))
 		}
 	}
@@ -152,12 +174,27 @@ func (r *HealthReport) failures() []string {
 }
 
 func (r *HealthReport) summary(strategy string) *CheckSummary {
+	groups := map[string]GroupStat{}
+	for name, g := range r.Groups {
+		if !coreGroup(name) {
+			groups[name] = *g
+		}
+	}
+	var skipped []string
+	for name := range r.Skipped {
+		if _, ok := groups[name]; ok {
+			skipped = append(skipped, name)
+		}
+	}
+	sort.Strings(skipped)
 	return &CheckSummary{
 		Time:        r.Time,
 		Strategy:    strategy,
 		Discord:     r.group("discord").String(),
 		YouTube:     r.group("youtube").String(),
 		Other:       r.otherGroups(),
+		Groups:      groups,
+		Skipped:     skipped,
 		Healthy:     r.Healthy,
 		NetworkDown: r.NetworkDown,
 		DNSProblem:  r.DNSProblem,
@@ -174,9 +211,14 @@ func (r *HealthReport) shortText() string {
 }
 
 // runHealth проверяет все адреса параллельно (их не больше maxTargets — по одной
-// горутине и одному соединению на адрес) и сводит результат.
-func runHealth(ctx context.Context, targets []Target, ratio float64, timeout time.Duration) *HealthReport {
-	return runHealthWith(ctx, targets, ratio, timeout, nil)
+// горутине и одному соединению на адрес) и сводит результат. skip — группы, которые
+// не влияют на решение «здоров» (см. App.skippedGroups).
+func runHealth(ctx context.Context, targets []Target, ratio float64, timeout time.Duration, skip map[string]bool) *HealthReport {
+	rep := runHealthWith(ctx, targets, ratio, timeout, nil)
+	if len(skip) > 0 {
+		rep = summarize(rep.Results, ratio, skip)
+	}
+	return rep
 }
 
 func runHealthWith(ctx context.Context, targets []Target, ratio float64, timeout time.Duration, roots *x509.CertPool) *HealthReport {
@@ -193,7 +235,7 @@ func runHealthWith(ctx context.Context, targets []Target, ratio float64, timeout
 		})
 	}
 	wg.Wait()
-	return summarize(results, ratio)
+	return summarize(results, ratio, nil)
 }
 
 // summarize — решающая логика сторожа:
@@ -201,9 +243,13 @@ func runHealthWith(ctx context.Context, targets []Target, ratio float64, timeout
 //     zapret не виноват, ничего не трогаем;
 //   - DNSProblem: хотя бы половина неудач — DNS или подменённый сертификат, смена стратегии
 //     не поможет;
-//   - Healthy: есть интернет и в каждой группе, кроме control, открылась доля ≥ ratio.
-func summarize(results []CheckResult, ratio float64) *HealthReport {
-	rep := &HealthReport{Time: time.Now(), Groups: map[string]*GroupStat{}, Results: results}
+//   - Healthy: есть интернет и в каждой группе, кроме control и групп из skip, открылась
+//     доля ≥ ratio.
+//
+// Группы из skip считаются в Score (стратегия, открывшая больше, лучше), но не в
+// Healthy и не в DNSProblem: их сбой — не повод чинить.
+func summarize(results []CheckResult, ratio float64, skip map[string]bool) *HealthReport {
+	rep := &HealthReport{Time: time.Now(), Groups: map[string]*GroupStat{}, Results: results, Skipped: skip}
 	failed, dnsLike := 0, 0
 	for _, res := range results {
 		g := rep.Groups[res.Group]
@@ -222,7 +268,7 @@ func summarize(results []CheckResult, ratio float64) *HealthReport {
 		if res.OK {
 			rep.Score++
 			rep.LatencyMs += res.Elapsed.Milliseconds()
-		} else {
+		} else if !skip[res.Group] {
 			failed++
 			if res.Kind == "dns" || res.Kind == "cert" {
 				dnsLike++
@@ -235,10 +281,7 @@ func summarize(results []CheckResult, ratio float64) *HealthReport {
 	rep.DNSProblem = failed > 0 && dnsLike*2 >= failed
 	rep.Healthy = !rep.NetworkDown
 	for name, g := range rep.Groups {
-		if name == "control" || g.Total == 0 {
-			continue
-		}
-		if float64(g.OK)/float64(g.Total) < ratio-1e-9 {
+		if !groupHealthy(name, *g, ratio, skip) {
 			rep.Healthy = false
 		}
 	}
