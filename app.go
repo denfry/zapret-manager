@@ -91,6 +91,7 @@ type State struct {
 	LastListsUpdate time.Time     `json:"last_lists_update"`
 	LastHostsUpdate time.Time     `json:"last_hosts_update"`
 	LastHeal        time.Time     `json:"last_heal"`
+	HealStreak      int           `json:"heal_streak"` // сколько подборов подряд не нашли рабочую стратегию
 	LastDNSWarn     time.Time     `json:"last_dns_warn"`
 	PausedUntil     time.Time     `json:"paused_until"`
 	BadVersions     []string      `json:"bad_versions,omitempty"`

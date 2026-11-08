@@ -181,7 +181,13 @@ func runHealth(ctx context.Context, targets []Target, ratio float64, timeout tim
 		wg.Add(1)
 		go func(i int, t Target) {
 			defer wg.Done()
-			results[i] = checkTarget(ctx, t, timeout, maxBodyBytes)
+			r := checkTarget(ctx, t, timeout, maxBodyBytes)
+			if r.Kind == "dns" && ctx.Err() == nil {
+				// одиночные сбои резолвера бывают (особенно с VPN, перехватывающим DNS) — повторим
+				time.Sleep(500 * time.Millisecond)
+				r = checkTarget(ctx, t, timeout, maxBodyBytes)
+			}
+			results[i] = r
 		}(i, t)
 	}
 	wg.Wait()
@@ -251,12 +257,32 @@ func checkTarget(ctx context.Context, t Target, timeout time.Duration, maxBody i
 	defer cancel()
 	deadline, _ := ctx.Deadline()
 
+	// DNS отдельно и со всем бюджетом: с VPN, перехватывающим DNS, ответ бывает и через 5 секунд,
+	// и это не должно выглядеть как блокировка IP.
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil || len(addrs) == 0 {
+		if err == nil {
+			err = &net.DNSError{Err: "нет адресов", Name: host}
+		}
+		res.Kind, res.Detail = "dns", err.Error()
+		return
+	}
+	sort.SliceStable(addrs, func(i, j int) bool { return addrs[i].IP.To4() != nil && addrs[j].IP.To4() == nil })
 	connectTimeout := timeout / 2
 	if connectTimeout > 4*time.Second {
 		connectTimeout = 4 * time.Second
 	}
-	d := net.Dialer{Timeout: connectTimeout}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+	var conn net.Conn
+	for i, ip := range addrs {
+		if i >= 2 {
+			break
+		}
+		d := net.Dialer{Timeout: connectTimeout}
+		conn, err = d.DialContext(ctx, "tcp", net.JoinHostPort(ip.IP.String(), port))
+		if err == nil || ctx.Err() != nil {
+			break
+		}
+	}
 	if err != nil {
 		res.Kind, res.Detail = classifyErr(err, "connect"), err.Error()
 		return

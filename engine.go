@@ -365,7 +365,9 @@ func (a *App) heal(ctx context.Context, rep *HealthReport) {
 		a.Log.Eventf("после перезапуска заработало (%s)", r2.shortText())
 		return
 	}
-	minGap := time.Duration(a.Cfg.MinSweepIntervalMin) * time.Minute
+	// если подборы подряд ничего не находят (например, лёг сам Discord), реже дёргаем сеть:
+	// 30 мин → 1 ч → 2 ч → 4 ч
+	minGap := time.Duration(a.Cfg.MinSweepIntervalMin) * time.Minute << min(st.HealStreak, 3)
 	if since := time.Since(st.LastHeal); since < minGap {
 		a.Log.Infof("подбор был %s назад, следующий не раньше чем через %s", since.Round(time.Minute), (minGap - since).Round(time.Minute))
 		return
@@ -373,6 +375,7 @@ func (a *App) heal(ctx context.Context, rep *HealthReport) {
 	a.updateState(func(s *State) { s.LastHeal = time.Now() })
 	a.Log.Eventf("перезапуск не помог — подбираю стратегию")
 	best, _, err := a.selectStrategy(ctx, relDir, strategy, selectOpts{quick: true, apply: true})
+	healed := false
 	switch {
 	case errors.Is(err, errNothingWorks):
 		a.Log.Eventf("ни одна стратегия zapret %s сейчас не работает", releaseVersion(relDir))
@@ -385,9 +388,17 @@ func (a *App) heal(ctx context.Context, rep *HealthReport) {
 		} else {
 			a.Log.Eventf("текущая стратегия %s по-прежнему лучшая (Discord %s, YouTube %s)", best.Strategy, best.Discord, best.YouTube)
 		}
-		if best.Healthy {
-			return
+		healed = best.Healthy
+	}
+	a.updateState(func(s *State) {
+		if healed {
+			s.HealStreak = 0
+		} else {
+			s.HealStreak++
 		}
+	})
+	if healed {
+		return
 	}
 	if a.Cfg.AutoUpdate {
 		a.Log.Infof("проверяю, не вышла ли новая версия zapret…")

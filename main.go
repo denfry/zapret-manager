@@ -158,7 +158,8 @@ func cmdInstall(ctx context.Context, a *App, args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	fmt.Printf("Ставлю zapret-manager %s в %s\n\n", appVersion, a.Root)
+	say, warn := a.Log.Infof, a.Log.Warnf
+	say("Ставлю zapret-manager %s в %s", appVersion, a.Root)
 
 	if err := stopManagerIfRunning(); err != nil {
 		return fail(err)
@@ -184,15 +185,17 @@ func cmdInstall(ctx context.Context, a *App, args []string) int {
 		if cerr != nil {
 			return fail(fmt.Errorf("не скопировать себя в %s: %w", target, cerr))
 		}
-		fmt.Println("✓ программа скопирована в", target)
+		say("✓ программа скопирована в %s", target)
 	}
 	if err := a.saveConfigIfMissing(); err != nil {
 		return fail(err)
 	}
 	a.reloadConfig()
 
+	var previousDir string
 	err = a.withLock(3*time.Minute, func() error {
 		oldDir, oldStrategy := a.currentInstall()
+		defer func() { previousDir = oldDir }()
 		if *fromFlag != "" {
 			if !validRelease(*fromFlag) {
 				return fmt.Errorf("%s не похожа на папку zapret-discord-youtube", *fromFlag)
@@ -203,21 +206,21 @@ func cmdInstall(ctx context.Context, a *App, args []string) int {
 			}
 		}
 		if oldDir != "" {
-			fmt.Printf("✓ нашёл текущую установку: %s (zapret %s, стратегия %s)\n", oldDir, releaseVersion(oldDir), orDash(oldStrategy))
-			fmt.Printf("  game filter: %s, ipset: %s\n", readGameFilter(oldDir), ipsetMode(oldDir))
+			say("✓ нашёл текущую установку: %s (zapret %s, стратегия %s)", oldDir, releaseVersion(oldDir), orDash(oldStrategy))
+			say("  game filter: %s, ipset: %s", readGameFilter(oldDir), ipsetMode(oldDir))
 		}
 
 		var newDir string
 		ver, verr := a.fetchLatestVersion(ctx)
 		if verr == nil {
-			fmt.Printf("✓ последняя версия Flowseal: %s\n", ver)
+			say("✓ последняя версия Flowseal: %s", ver)
 			newDir, verr = a.downloadRelease(ctx, ver, false)
 		}
 		if verr != nil {
 			if oldDir == "" {
 				return fmt.Errorf("не скачать zapret: %w", verr)
 			}
-			fmt.Printf("! не скачать релиз (%v) — переношу текущую папку как есть\n", verr)
+			warn("не скачать релиз (%v) — переношу текущую папку как есть", verr)
 			newDir = filepath.Join(a.releasesDir(), releaseVersion(oldDir))
 			if !samePath(oldDir, newDir) {
 				if err := copyDir(oldDir, newDir); err != nil {
@@ -225,10 +228,10 @@ func cmdInstall(ctx context.Context, a *App, args []string) int {
 				}
 			}
 		}
-		fmt.Printf("✓ zapret %s в %s\n", releaseVersion(newDir), newDir)
+		say("✓ zapret %s в %s", releaseVersion(newDir), newDir)
 		if oldDir != "" && !samePath(oldDir, newDir) {
 			migrateUserFiles(oldDir, newDir)
-			fmt.Println("✓ перенёс свои списки, game filter и режим ipset")
+			say("✓ перенёс свои списки, game filter и режим ipset")
 		}
 		if err := ensureUserLists(newDir); err != nil {
 			return err
@@ -236,30 +239,30 @@ func cmdInstall(ctx context.Context, a *App, args []string) int {
 
 		if a.Cfg.UpdateIpset {
 			if changed, err := a.updateIpset(ctx, newDir); err != nil {
-				fmt.Println("! ipset:", err)
+				warn("ipset: %v", err)
 			} else {
 				a.updateState(func(st *State) { st.LastIpsetUpdate = time.Now() })
-				fmt.Printf("✓ ipset %s (режим %s)\n", map[bool]string{true: "обновлён", false: "актуален"}[changed], ipsetMode(newDir))
+				say("✓ ipset %s (режим %s)", map[bool]string{true: "обновлён", false: "актуален"}[changed], ipsetMode(newDir))
 			}
 		}
 		if a.Cfg.UpdateListsFromMain {
 			changed, err := a.updateMainLists(ctx, newDir)
 			if err != nil {
-				fmt.Println("! списки:", err)
+				warn("списки: %v", err)
 			}
 			a.updateState(func(st *State) { st.LastListsUpdate = time.Now() })
 			if len(changed) > 0 {
-				fmt.Println("✓ списки из main:", strings.Join(changed, ", "))
+				say("✓ списки из main: %s", strings.Join(changed, ", "))
 			} else if err == nil {
-				fmt.Println("✓ списки доменов актуальны")
+				say("✓ списки доменов актуальны")
 			}
 		}
 		if a.Cfg.UpdateHosts {
 			if changed, err := a.updateHosts(ctx); err != nil {
-				fmt.Println("! hosts:", err)
+				warn("hosts: %v", err)
 			} else {
 				a.updateState(func(st *State) { st.LastHostsUpdate = time.Now() })
-				fmt.Printf("✓ hosts %s\n", map[bool]string{true: "обновлён (старая копия в backups\\)", false: "актуален"}[changed])
+				say("✓ hosts %s", map[bool]string{true: "обновлён (старая копия в backups\\)", false: "актуален"}[changed])
 			}
 		}
 		a.updateState(func(st *State) { st.LastUpdateCheck = time.Now() })
@@ -270,43 +273,51 @@ func cmdInstall(ctx context.Context, a *App, args []string) int {
 		}
 		if name != "" {
 			if s, err := a.findStrategy(newDir, name); err != nil {
-				fmt.Printf("! %v — подберу заново\n", err)
+				warn("%v — подберу заново", err)
 				name = ""
 			} else {
 				name = s.Name
 			}
 		}
-		if *selectFlag || name == "" {
-			fmt.Println()
-			best, ranking, err := a.selectStrategy(ctx, newDir, name, selectOpts{apply: true, progress: func(s string) { fmt.Println(s) }})
+		runSelect := func() error {
+			best, ranking, err := a.selectStrategy(ctx, newDir, name, selectOpts{apply: true})
 			printRanking(ranking, 5)
-			if err != nil {
-				if errors.Is(err, errNothingWorks) && best != nil {
-					fmt.Println("! ни одна стратегия не открыла всё — ставлю лучшую из имеющихся")
-					if aerr := a.applyStrategy(newDir, best.Strategy); aerr != nil {
-						return aerr
-					}
-				} else {
-					return err
-				}
+			logRanking(a, ranking, 5)
+			if err == nil {
+				say("✓ стоит %s", best.Strategy)
+				return nil
+			}
+			if !errors.Is(err, errNothingWorks) {
+				return err
+			}
+			// ничего не открылось целиком — оставляем прежнюю, а если её нет, лучшую из плохих
+			fallback := name
+			if fallback == "" && best != nil && best.Error == "" {
+				fallback = best.Strategy
+			}
+			if fallback == "" {
+				return err
+			}
+			warn("ни одна стратегия не открыла всё — ставлю %s", fallback)
+			return a.applyStrategy(newDir, fallback)
+		}
+		if *selectFlag || name == "" {
+			if err := runSelect(); err != nil {
+				return err
 			}
 		} else {
 			if err := a.applyStrategy(newDir, name); err != nil {
 				return err
 			}
-			fmt.Println("✓ служба zapret со стратегией", name)
+			say("✓ служба zapret со стратегией %s", name)
 			_ = sleepCtx(ctx, 2*time.Second)
 			rep := a.checkNow(ctx)
 			printReport(rep)
+			say("проверка: %s", rep.shortText())
 			if !rep.Healthy && !rep.NetworkDown {
-				fmt.Println("\nСтратегия не открывает всё — подбираю лучшую…")
-				best, ranking, err := a.selectStrategy(ctx, newDir, name, selectOpts{apply: true, progress: func(s string) { fmt.Println(s) }})
-				printRanking(ranking, 5)
-				if err != nil && !errors.Is(err, errNothingWorks) {
+				say("стратегия %s открывает не всё — подбираю лучшую…", name)
+				if err := runSelect(); err != nil {
 					return err
-				}
-				if best != nil {
-					fmt.Println("✓ стоит", best.Strategy)
 				}
 			}
 		}
@@ -314,26 +325,38 @@ func cmdInstall(ctx context.Context, a *App, args []string) int {
 		return nil
 	})
 	if err != nil {
-		return fail(err)
+		warn("установка прервана: %v", err)
+		return 1
 	}
 
 	if !*noWatch {
 		if err := installManagerService(target); err != nil {
-			return fail(err)
+			warn("служба-сторож: %v", err)
+			return 1
 		}
 		if err := startService(managerSvcName, 15*time.Second); err != nil {
-			return fail(err)
+			warn("служба-сторож: %v", err)
+			return 1
 		}
-		fmt.Println("✓ служба-сторож zapret-manager запущена")
+		say("✓ служба-сторож zapret-manager запущена")
 	}
 	a.Log.Eventf("установка завершена")
 	fmt.Println()
 	cmdStatus(ctx, a, nil)
 	relDir, _ := a.currentInstall()
-	if old := strings.TrimSpace(*fromFlag); old != "" && !samePath(old, relDir) {
-		fmt.Printf("\nСтарую папку %s можно удалить.\n", old)
+	if previousDir != "" && !samePath(previousDir, relDir) && !strings.HasPrefix(strings.ToLower(previousDir), strings.ToLower(a.releasesDir())) {
+		fmt.Printf("\nСтарая папка %s больше не используется — её можно удалить.\n", previousDir)
 	}
 	return 0
+}
+
+func logRanking(a *App, r []RankEntry, n int) {
+	for i, e := range r {
+		if i >= n {
+			break
+		}
+		a.Log.Debugf("  %d. %s", i+1, e.Line())
+	}
 }
 
 // ---------- status ----------
@@ -446,24 +469,34 @@ func (a *App) lastEvents(n int) []string {
 
 // ---------- check / select / use / list ----------
 
-func cmdCheck(ctx context.Context, a *App, _ []string) int {
+func cmdCheck(ctx context.Context, a *App, args []string) int {
+	fs := newFlags("check")
+	verbose := fs.Bool("v", false, "показать текст ошибок")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 	_, strategy := a.currentInstall()
 	fmt.Printf("Проверяю (стратегия %s)…\n\n", orDash(strategy))
 	rep := a.checkNow(ctx)
-	printReport(rep)
+	printReportV(rep, *verbose)
 	if rep.Healthy {
 		return 0
 	}
 	return 1
 }
 
-func printReport(rep *HealthReport) {
+func printReport(rep *HealthReport) { printReportV(rep, false) }
+
+func printReportV(rep *HealthReport, verbose bool) {
 	for _, r := range rep.Results {
 		mark := "✓"
 		info := fmt.Sprintf("HTTP %d, %d КБ, %d мс", r.Status, r.Bytes/1024, r.Elapsed.Milliseconds())
 		if !r.OK {
 			mark = "✗"
 			info = kindText(r)
+			if verbose && r.Detail != "" {
+				info += " — " + r.Detail
+			}
 		}
 		fmt.Printf("  %s %-20s %s\n", mark, r.Name, info)
 	}
@@ -505,8 +538,9 @@ func cmdSelect(ctx context.Context, a *App, args []string) int {
 		if relDir == "" {
 			return errors.New("zapret не установлен — сначала zapret-manager install")
 		}
-		best, ranking, err := a.selectStrategy(ctx, relDir, current, selectOpts{quick: *quick, apply: !*dry, progress: func(s string) { fmt.Println(s) }})
+		best, ranking, err := a.selectStrategy(ctx, relDir, current, selectOpts{quick: *quick, apply: !*dry})
 		printRanking(ranking, 8)
+		logRanking(a, ranking, 8)
 		if err != nil {
 			return err
 		}

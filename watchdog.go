@@ -195,6 +195,9 @@ func (a *App) periodicCheck(ctx context.Context, fails *int) time.Duration {
 			if *fails > 0 {
 				a.Log.Infof("снова работает (%s)", rep.shortText())
 			}
+			if a.loadState().HealStreak > 0 {
+				a.updateState(func(s *State) { s.HealStreak = 0 })
+			}
 			a.Log.Debugf("ok: %s", rep.shortText())
 			*fails = 0
 			return nil
