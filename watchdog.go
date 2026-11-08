@@ -164,6 +164,9 @@ func (a *App) ensureRunning() {
 	if !info.Exists || info.State == svc.Running || info.State == svc.StartPending {
 		return
 	}
+	if time.Since(a.lastStartFail) < 5*time.Minute {
+		return
+	}
 	_ = a.withLock(0, func() error {
 		info := queryService(zapretSvcName)
 		if !info.Exists || info.State == svc.Running {
@@ -174,7 +177,8 @@ func (a *App) ensureRunning() {
 			_ = setServiceStartType(zapretSvcName, mgr.StartAutomatic)
 		}
 		if err := startService(zapretSvcName, 15*time.Second); err != nil {
-			a.Log.Warnf("zapret: %v", err)
+			a.lastStartFail = time.Now()
+			a.Log.Warnf("zapret не запускается (%v) — следующая попытка через 5 минут", err)
 		}
 		return nil
 	})

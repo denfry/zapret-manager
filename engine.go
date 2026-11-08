@@ -58,6 +58,8 @@ func (a *App) applyStrategy(relDir, name string) error {
 	}
 	enableTCPTimestamps()
 	oldDir, _ := a.currentInstall()
+	prev := queryService(zapretSvcName)
+	prevStrategy := readRegistryStrategy()
 	if err := stopService(zapretSvcName, 15*time.Second); err != nil {
 		return err
 	}
@@ -80,6 +82,14 @@ func (a *App) applyStrategy(relDir, name string) error {
 			err = fmt.Errorf("%v; %v", err, perr)
 		} else {
 			p.Stop()
+		}
+		// не оставляем службу со сломанной строкой — возвращаем прежнюю
+		if prev.Exists && prev.BinPath != "" && prev.BinPath != cmdline {
+			if rerr := installZapretService(prev.BinPath, prevStrategy); rerr == nil {
+				if serr := startService(zapretSvcName, 15*time.Second); serr == nil {
+					a.Log.Warnf("стратегия %s не запустилась — вернул прежнюю (%s)", s.Name, orDash(prevStrategy))
+				}
+			}
 		}
 		return err
 	}

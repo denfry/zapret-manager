@@ -123,6 +123,8 @@ type App struct {
 	Cfg     Config
 	Log     *Logger
 	stateMu sync.Mutex
+
+	lastStartFail time.Time // чтобы ensureRunning не долбил SCM каждые 30 с, если служба не стартует
 }
 
 func newApp(dirFlag string, console bool) *App {

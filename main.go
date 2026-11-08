@@ -667,13 +667,19 @@ func cmdOff(_ context.Context, a *App, args []string) int {
 		}
 		until = time.Now().Add(time.Duration(m) * time.Minute)
 	}
-	a.updateState(func(st *State) { st.PausedUntil = until })
-	if err := stopService(zapretSvcName, 15*time.Second); err != nil {
+	err := a.withLock(3*time.Minute, func() error {
+		a.updateState(func(st *State) { st.PausedUntil = until })
+		if err := stopService(zapretSvcName, 15*time.Second); err != nil {
+			return err
+		}
+		killProcesses("winws.exe")
+		// ручной запуск — чтобы после перезагрузки посреди паузы zapret сам не поднялся
+		return setServiceStartType(zapretSvcName, mgr.StartManual)
+	})
+	if err != nil {
 		return fail(err)
 	}
-	killProcesses("winws.exe")
 	if until.Year() > 3000 {
-		_ = setServiceStartType(zapretSvcName, mgr.StartManual)
 		fmt.Println("zapret выключен до команды: zapret-manager on")
 		a.Log.Eventf("zapret выключен вручную")
 	} else {
@@ -684,9 +690,12 @@ func cmdOff(_ context.Context, a *App, args []string) int {
 }
 
 func cmdOn(ctx context.Context, a *App, _ []string) int {
-	a.updateState(func(st *State) { st.PausedUntil = time.Time{} })
-	_ = setServiceStartType(zapretSvcName, mgr.StartAutomatic)
-	if err := startService(zapretSvcName, 15*time.Second); err != nil {
+	err := a.withLock(3*time.Minute, func() error {
+		a.updateState(func(st *State) { st.PausedUntil = time.Time{} })
+		_ = setServiceStartType(zapretSvcName, mgr.StartAutomatic)
+		return startService(zapretSvcName, 15*time.Second)
+	})
+	if err != nil {
 		return fail(err)
 	}
 	a.Log.Eventf("zapret включён вручную")
