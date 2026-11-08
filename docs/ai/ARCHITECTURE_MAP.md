@@ -6,7 +6,7 @@
 ## Слои
 
 ```
-main.go (CLI)            watchdog.go (служба)
+menu.go → main.go (CLI)  watchdog.go (служба)
         \                  /
          engine.go — бизнес-логика: install/select/heal/update
         /     |      \        \
@@ -26,7 +26,8 @@ main.go (CLI)            watchdog.go (служба)
 |---|---|---|
 | `zapret-manager <команда>` | `main.runCLI` | таблица `commands`; команды с `admin: true` перезапускаются через UAC (`relaunchElevated`) |
 | служба `zapret-manager` | `main` → `runAsService` → `managerService.Execute` | `App.watchdog` |
-| двойной клик | `runCLI` без аргументов | справка + `cmdStatus`, ожидание Enter |
+| двойной клик | `runCLI` без аргументов → `cmdMenu` (`menu.go`) | один запрос UAC (`runElevated`), затем меню; пункты вызывают те же `cmdX` через `findCommand` |
+| `runCLI` без аргументов из консоли | `main.runCLI` | справка + `cmdStatus` |
 
 ## Основные потоки
 

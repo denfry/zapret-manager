@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -615,36 +616,47 @@ func launchedFromExplorer() bool {
 	return n == 1
 }
 
+// relaunchElevated выполняет команду в отдельном окне с правами администратора;
+// окно ждёт Enter (--pause), чтобы человек успел прочитать результат.
 func relaunchElevated(args []string) int {
-	exe, err := os.Executable()
-	if err != nil {
-		fmt.Println("Не найти свой exe:", err)
+	if !slices.Contains(args, "--pause") {
+		args = append(slices.Clip(args), "--pause")
+	}
+	if err := runElevated(args); err != nil {
+		if errors.Is(err, windows.ERROR_CANCELLED) {
+			fmt.Println("Нужны права администратора, а запрос UAC отклонён.")
+		} else {
+			fmt.Println("Нужны права администратора, а запрос UAC не прошёл:", err)
+		}
 		return 1
 	}
-	hasPause := false
-	for _, a := range args {
-		if a == "--pause" {
-			hasPause = true
-		}
-	}
-	if !hasPause {
-		args = append(args, "--pause")
+	fmt.Println("Команда открыта в отдельном окне с правами администратора.")
+	return 0
+}
+
+// runElevated запускает этот же exe с аргументами args через запрос UAC.
+// Отказ в запросе — windows.ERROR_CANCELLED.
+func runElevated(args []string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("не найти свой exe: %w", err)
 	}
 	quoted := make([]string, len(args))
 	for i, a := range args {
 		quoted[i] = syscall.EscapeArg(a)
 	}
 	verb, _ := windows.UTF16PtrFromString("runas")
-	file, _ := windows.UTF16PtrFromString(exe)
-	params, _ := windows.UTF16PtrFromString(strings.Join(quoted, " "))
-	cwd, _ := os.Getwd()
-	dir, _ := windows.UTF16PtrFromString(cwd)
-	if err := windows.ShellExecute(0, verb, file, params, dir, windows.SW_SHOWNORMAL); err != nil {
-		fmt.Println("Нужны права администратора, а запрос UAC не прошёл:", err)
-		return 1
+	file, err := windows.UTF16PtrFromString(exe)
+	if err != nil {
+		return err
 	}
-	fmt.Println("Команда открыта в отдельном окне с правами администратора.")
-	return 0
+	params, err := windows.UTF16PtrFromString(strings.Join(quoted, " "))
+	if err != nil {
+		return err
+	}
+	cwd, _ := os.Getwd()
+	dir, _ := windows.UTF16PtrFromString(cwd) // "" или ошибка — ShellExecute возьмёт текущую папку
+	return windows.ShellExecute(0, verb, file, params, dir, windows.SW_SHOWNORMAL)
 }
 
 func setupConsole() {

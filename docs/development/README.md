@@ -40,7 +40,7 @@ internal/zapretfmt   game filter, ipset, списки
 internal/textutil    BOM, строки
 internal/*/testdata/fuzz  регрессионный корпус fuzz
 scripts/check.ps1    локальный quality gate
-.github/             CI и Dependabot
+.github/             CI, релизы (release.yml + release-notes.md) и Dependabot
 docs/                документация (architecture, security, network, development, deployment, ai, engineering)
 ```
 
@@ -51,6 +51,19 @@ docs/                документация (architecture, security, network, 
 - Сообщения пользователю и комментарии — по-русски; идентификаторы — по-английски.
 - Комментарии объясняют «почему», а не пересказывают код.
 - Новые зависимости — только с записью в `docs/ai/DECISIONS.md`.
+
+## Выпуск релиза
+
+1. `scripts\check.ps1` — зелёный; обновить `appVersion` в `main.go` (для локальных сборок).
+2. `git tag v1.2.3 && git push origin v1.2.3`.
+3. `.github/workflows/release.yml`: vet + тесты → сборка с `-X main.appVersion=1.2.3` (номер
+   берётся из тега, сборка проверяет, что `version` его печатает) → `zapret-manager.exe.sha256`
+   → аттестация происхождения сборки (Sigstore) → GitHub Release через `gh release create`
+   с текстом из `.github/release-notes.md` и автосписком изменений.
+
+Ссылка `releases/latest/download/zapret-manager.exe` из README всегда ведёт на последний релиз.
+Exe не подписан сертификатом (SmartScreen предупреждает); подлинность проверяется
+`gh attestation verify zapret-manager.exe -R denfry/zapret-manager`.
 
 ## Обновление зависимостей
 

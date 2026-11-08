@@ -21,8 +21,11 @@ import (
 	"zapret-manager/internal/hostsfile"
 )
 
+// appVersion — версия программы; сборка релиза подставляет номер из тега:
+// -ldflags "-X main.appVersion=1.2.3".
+var appVersion = "1.1.0"
+
 const (
-	appVersion     = "1.0.0"
 	managerSvcName = "zapret-manager"
 	zapretSvcName  = "zapret"
 	defaultRoot    = `C:\zapret`
@@ -39,6 +42,7 @@ var commands []command
 
 func init() {
 	commands = []command{
+		{"menu", false, "menu — меню по пунктам (открывается и двойным щелчком по exe)", cmdMenu},
 		{"install", true, "install [--strategy ИМЯ] [--from ПАПКА] [--select] — поставить в C:\\zapret, перенести текущую установку, включить службу-сторож", cmdInstall},
 		{"status", false, "status — что стоит и как работает", cmdStatus},
 		{"check", false, "check — проверить Discord и YouTube прямо сейчас", cmdCheck},
@@ -94,26 +98,20 @@ func runCLI(args []string) int {
 		}
 	}
 	if len(rest) == 0 {
-		usage()
-		fmt.Println()
-		a := newApp(dir, true)
-		cmdStatus(context.Background(), a, nil)
-		if launchedFromExplorer() {
-			waitEnter()
+		if !launchedFromExplorer() {
+			usage()
+			fmt.Println()
+			cmdStatus(context.Background(), newApp(dir, true), nil)
+			return 0
 		}
-		return 0
+		rest = []string{"menu"} // двойной клик по exe
 	}
 	name := strings.ToLower(rest[0])
 	if name == "help" || name == "-h" || name == "--help" || name == "/?" {
 		usage()
 		return 0
 	}
-	var cmd *command
-	for i := range commands {
-		if commands[i].name == name {
-			cmd = &commands[i]
-		}
-	}
+	cmd := findCommand(name)
 	if cmd == nil {
 		fmt.Printf("Нет такой команды: %s\n\n", rest[0])
 		usage()
@@ -126,10 +124,20 @@ func runCLI(args []string) int {
 	defer stop()
 	a := newApp(dir, true)
 	code := cmd.run(ctx, a, rest[1:])
-	if pause || launchedFromExplorer() {
+	// из меню выходят пунктом «0» — второй раз Enter не спрашиваем
+	if (pause || launchedFromExplorer()) && cmd.name != "menu" {
 		waitEnter()
 	}
 	return code
+}
+
+func findCommand(name string) *command {
+	for i := range commands {
+		if commands[i].name == name {
+			return &commands[i]
+		}
+	}
+	return nil
 }
 
 func waitEnter() {
@@ -607,14 +615,40 @@ func cmdUse(ctx context.Context, a *App, args []string) int {
 }
 
 func cmdList(_ context.Context, a *App, _ []string) int {
+	rows, sweep, err := a.strategyRows()
+	if err != nil {
+		return fail(err)
+	}
+	if !sweep.IsZero() {
+		fmt.Printf("Результаты подбора %s:\n\n", sweep.Format("02.01 15:04"))
+	}
+	for _, r := range rows {
+		mark := "  "
+		if r.Current {
+			mark = "→ "
+		}
+		fmt.Println(mark + r.Line)
+	}
+	return 0
+}
+
+// strategyRow — стратегия для списка: имя и результат последнего подбора, если был.
+type strategyRow struct {
+	Name    string
+	Line    string // имя или строка рейтинга; у своих стратегий — пометка (custom)
+	Current bool
+}
+
+// strategyRows — стратегии установленного релиза; sweep — время подбора, чьи
+// результаты подставлены (нулевое, если подбора по этому релизу не было).
+func (a *App) strategyRows() (rows []strategyRow, sweep time.Time, err error) {
 	relDir, current := a.currentInstall()
 	if relDir == "" {
-		fmt.Println("zapret не установлен")
-		return 1
+		return nil, time.Time{}, errors.New("zapret не установлен")
 	}
 	all, err := a.listAllStrategies(relDir)
 	if err != nil {
-		return fail(err)
+		return nil, time.Time{}, err
 	}
 	st := a.loadState()
 	results := map[string]RankEntry{}
@@ -622,13 +656,9 @@ func cmdList(_ context.Context, a *App, _ []string) int {
 		for _, e := range st.LastSweep.Ranking {
 			results[strings.ToLower(e.Strategy)] = e
 		}
-		fmt.Printf("Результаты подбора %s:\n\n", st.LastSweep.Time.Format("02.01 15:04"))
+		sweep = st.LastSweep.Time
 	}
 	for _, s := range all {
-		mark := "  "
-		if strings.EqualFold(s.Name, current) {
-			mark = "→ "
-		}
 		line := s.Name
 		if e, ok := results[strings.ToLower(s.Name)]; ok {
 			line = e.Line()
@@ -636,9 +666,9 @@ func cmdList(_ context.Context, a *App, _ []string) int {
 		if s.Custom {
 			line += "  (custom)"
 		}
-		fmt.Println(mark + line)
+		rows = append(rows, strategyRow{Name: s.Name, Line: line, Current: strings.EqualFold(s.Name, current)})
 	}
-	return 0
+	return rows, sweep, nil
 }
 
 // ---------- update / hosts ----------
@@ -681,15 +711,28 @@ func cmdHosts(ctx context.Context, a *App, _ []string) int {
 
 // ---------- off / on ----------
 
+// maxOffMinutes — неделя; дольше — это уже «off» без срока.
+const maxOffMinutes = 7 * 24 * 60
+
+// parseOffMinutes разбирает срок паузы для off. Верхняя граница заодно не даёт
+// time.Duration переполниться (огромное число дало бы срок в прошлом).
+func parseOffMinutes(s string) (time.Duration, error) {
+	m, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || m <= 0 || m > maxOffMinutes {
+		return 0, fmt.Errorf("нужно число минут от 1 до %d, например 30 (без числа — до включения вручную)", maxOffMinutes)
+	}
+	return time.Duration(m) * time.Minute, nil
+}
+
 func cmdOff(_ context.Context, a *App, args []string) int {
 	until := time.Date(9999, 1, 1, 0, 0, 0, 0, time.Local)
 	if len(args) > 0 {
-		m, err := strconv.Atoi(args[0])
-		if err != nil || m <= 0 {
-			fmt.Println("off [МИНУТЫ] — например: off 30")
+		d, err := parseOffMinutes(args[0])
+		if err != nil {
+			fmt.Println("off [МИНУТЫ]:", err)
 			return 2
 		}
-		until = time.Now().Add(time.Duration(m) * time.Minute)
+		until = time.Now().Add(d)
 	}
 	err := a.withLock(3*time.Minute, func() error {
 		// паузу ставим до остановки: иначе сторож может успеть поднять службу обратно
