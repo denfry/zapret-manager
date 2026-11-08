@@ -62,11 +62,12 @@ jobs:
       - name: tests (race detector)
         env:
           CGO_ENABLED: "1" # -race needs cgo; the runner ships MinGW gcc
-        run: go test -race -count=1 -coverprofile=coverage.out ./...
+        # quoted: unquoted, PowerShell splits -coverprofile=coverage.out into "-coverprofile=coverage" ".out"
+        run: go test -race -count=1 "-coverprofile=coverage.out" ./...
 
       - name: coverage summary
         shell: pwsh
-        run: go tool cover -func=coverage.out | Select-Object -Last 1
+        run: go tool cover "-func=coverage.out" | Select-Object -Last 1
 
       - name: fuzz smoke (15s per target)
         shell: pwsh
