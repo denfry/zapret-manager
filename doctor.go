@@ -52,7 +52,7 @@ func (a *App) runDoctor() int {
 		if cyrillicRe.MatchString(relDir) {
 			warn("в пути к zapret кириллица — winws может не найти файлы")
 		}
-		if od := os.Getenv("OneDrive"); od != "" && strings.HasPrefix(strings.ToLower(relDir), strings.ToLower(od)) {
+		if od := os.Getenv("OneDrive"); od != "" && isWithin(relDir, od) {
 			bad("zapret лежит в OneDrive — перенесите (zapret-manager install кладёт в C:\\zapret)")
 			problems++
 		}
@@ -174,16 +174,19 @@ func (a *App) runDoctor() int {
 		warn("DNS-over-HTTPS в Windows не настроен — провайдер может подменять DNS (Параметры → Сеть → DNS → Шифрование)")
 	}
 
-	if err := enableTCPTimestamps(); err != nil {
-		bad("TCP timestamps не включить: " + err.Error())
-		problems++
-	} else {
+	// Только читаем: диагностика систему не меняет. Включает их applyStrategy.
+	switch tcpTimestampsState() {
+	case "enabled":
 		ok("TCP timestamps включены (нужны стратегиям с fooling=ts)")
+	case "disabled":
+		bad("TCP timestamps выключены — стратегии с fooling=ts не работают; включатся при установке стратегии (use / select)")
+		problems++
+	default:
+		warn("TCP timestamps: состояние не определить (netsh interface tcp show global)")
 	}
 
 	if data, err := os.ReadFile(hostsPath()); err == nil {
-		text := strings.ToLower(string(data))
-		if strings.Contains(text, "youtube.com") || strings.Contains(text, "youtu.be") {
+		if hostsHasYouTube(string(data)) {
 			warn("в hosts есть записи youtube.com/youtu.be — они ломают YouTube")
 		}
 		if strings.Contains(string(data), hostsfile.Begin) {
@@ -206,20 +209,57 @@ func tunAdapters() []string {
 		return nil
 	}
 	var out []string
-	keys := []string{"tun", "wintun", "wireguard", "happ", "amnezia", "outline", "vpn", "tap-", "openvpn", "nekoray", "v2ray", "clash", "sing"}
 	for _, i := range ifs {
-		if i.Flags&net.FlagUp == 0 {
-			continue
-		}
-		name := strings.ToLower(i.Name)
-		for _, k := range keys {
-			if strings.Contains(name, k) {
-				out = append(out, i.Name)
-				break
-			}
+		if i.Flags&net.FlagUp != 0 && isTunnelAdapter(i.Name) {
+			out = append(out, i.Name)
 		}
 	}
 	return out
+}
+
+// isTunnelAdapter — похоже ли имя сетевого адаптера на VPN/туннель. Сравнивает по
+// словам имени: короткие ключи (tun, tap, sing, happ) — только целым словом или со
+// счётчиком (tun0), иначе «Teredo Tunneling Pseudo-Interface» выглядел бы как VPN.
+func isTunnelAdapter(name string) bool {
+	short := []string{"tun", "tap", "sing", "happ"}
+	long := []string{"vpn", "wintun", "wireguard", "amnezia", "outline", "nekoray", "v2ray", "clash"}
+	words := strings.FieldsFunc(strings.ToLower(name), func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9')
+	})
+	for _, w := range words {
+		for _, k := range short {
+			if w == k || (strings.HasPrefix(w, k) && strings.Trim(w[len(k):], "0123456789") == "") {
+				return true
+			}
+		}
+		for _, k := range long {
+			if strings.Contains(w, k) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hostsHasYouTube — есть ли в hosts действующая (не закомментированная) запись для
+// youtube.com, его поддоменов или youtu.be.
+func hostsHasYouTube(text string) bool {
+	for line := range strings.SplitSeq(text, "\n") {
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		fields := strings.Fields(strings.ToLower(line))
+		if len(fields) < 2 {
+			continue
+		}
+		for _, h := range fields[1:] {
+			h = strings.TrimSuffix(h, ".")
+			if h == "youtube.com" || strings.HasSuffix(h, ".youtube.com") || h == "youtu.be" || strings.HasSuffix(h, ".youtu.be") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func dohInterfaces() int {
@@ -266,4 +306,40 @@ func unique(in []string) []string {
 		}
 	}
 	return out
+}
+
+// tcpTimestampsState — "enabled", "disabled" или "" (не удалось узнать).
+func tcpTimestampsState() string {
+	netsh, err := systemBinary("netsh.exe")
+	if err != nil {
+		return ""
+	}
+	out, err := runHidden(netsh, "interface", "tcp", "show", "global")
+	if err != nil {
+		return ""
+	}
+	return parseTCPTimestamps(out)
+}
+
+// parseTCPTimestamps ищет в выводе «netsh interface tcp show global» строку
+// «RFC 1323 Timestamps : enabled». Название в локализованной Windows переведено
+// (и приходит в OEM-кодировке), поэтому строку ищем по «1323», а значение — по
+// английскому слову; иначе "".
+func parseTCPTimestamps(out string) string {
+	for line := range strings.SplitSeq(out, "\n") {
+		if !strings.Contains(line, "1323") {
+			continue
+		}
+		i := strings.LastIndex(line, ":")
+		if i < 0 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(line[i+1:])) {
+		case "enabled":
+			return "enabled"
+		case "disabled":
+			return "disabled"
+		}
+	}
+	return ""
 }

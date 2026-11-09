@@ -63,7 +63,7 @@ build.cmd                               # тесты + dist\zapret-manager.exe
 
 1. **Не запускай команды, меняющие систему, без явного разрешения пользователя:**
    `install`, `select` (без `--dry-run`), `use`, `update`, `hosts`, `off`, `on`,
-   `uninstall`, `sc stop/delete`, правку hosts, `netsh`. Безопасно: `version`, `status`,
+   `uninstall`, `sc stop/delete`, правку hosts, `netsh`. Безопасно (только читают): `version`, `status`, `doctor`,
    `check`, `list`, `log`, `help` — лучше с `--dir <временная папка>`.
 2. **Всё, что попадает в binPath службы или в CreateProcess, проверяется.** Новые
    переменные в .bat — только через `batch.ExtractWinwsArgs` (неизвестная переменная —
