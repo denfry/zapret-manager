@@ -247,3 +247,54 @@ func TestPathHelpers(t *testing.T) {
 		}
 	}
 }
+
+// Временная ошибка чтения (здесь — state.json оказался папкой) не порча: файл не
+// откладывается в .corrupt и не затирается пустым состоянием.
+func TestUpdateStateKeepsUnreadableState(t *testing.T) {
+	a := testApp(t)
+	p := a.path("state.json")
+	if err := os.Mkdir(p, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.updateState(func(st *State) { st.Strategy = "x" })
+	if !dirExists(p) {
+		t.Fatal("state.json переименован или заменён, хотя он не испорчен")
+	}
+	if m, _ := filepath.Glob(a.path("state.json.corrupt-*")); len(m) != 0 {
+		t.Fatalf("лишняя копия: %v", m)
+	}
+}
+
+func TestReadStateCorruptIsTyped(t *testing.T) {
+	a := testApp(t)
+	if err := os.WriteFile(a.path("state.json"), []byte("{oops"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.readState(); !errors.Is(err, errStateCorrupt) {
+		t.Fatalf("ждал errStateCorrupt, получил %v", err)
+	}
+}
+
+func TestWriteFileReplaceNeverOverwritesInPlace(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(p, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// держим файл открытым без FILE_SHARE_DELETE — замена невозможна
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = writeFileReplace(p, []byte("new"))
+	_ = f.Close()
+	if err == nil {
+		t.Skip("ОС позволила заменить открытый файл — проверять нечего")
+	}
+	if data, _ := os.ReadFile(p); string(data) != "old" {
+		t.Fatalf("файл переписан на месте: %q", data)
+	}
+	if m, _ := filepath.Glob(filepath.Join(dir, "*.tmp")); len(m) != 0 {
+		t.Fatalf("остался временный файл: %v", m)
+	}
+}

@@ -258,6 +258,10 @@ func (a *App) saveConfigIfMissing() error {
 	return writeFileAtomic(p, data)
 }
 
+// errStateCorrupt — state.json прочитан, но это не JSON состояния. Только такую ошибку
+// можно считать порчей: прочие (файл занят антивирусом, нет прав) — временные.
+var errStateCorrupt = errors.New("state.json испорчен")
+
 // readState читает state.json. Отсутствующий файл — пустое состояние без ошибки.
 func (a *App) readState() (State, error) {
 	var st State
@@ -269,15 +273,25 @@ func (a *App) readState() (State, error) {
 		return st, err
 	}
 	if err := json.Unmarshal(textutil.StripBOM(data), &st); err != nil {
-		return State{}, err
+		return State{}, fmt.Errorf("%w: %w", errStateCorrupt, err)
 	}
 	return st, nil
 }
 
 // loadState — состояние для чтения; при ошибке пустое (status и проверки не должны падать).
+// Читает без блокировки, поэтому временную ошибку (файл как раз заменяют) повторяет:
+// пустое состояние вместо настоящего — это, например, «паузы нет», и сторож включил бы
+// zapret, выключенный командой off.
 func (a *App) loadState() State {
-	st, _ := a.readState()
-	return st
+	var st State
+	var err error
+	for range 5 {
+		if st, err = a.readState(); err == nil {
+			return st
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return State{}
 }
 
 // stateLockTimeout — сколько ждать, пока другой процесс допишет state.json.
@@ -298,6 +312,11 @@ func (a *App) updateState(fn func(*State)) {
 	}
 	defer release()
 	st, err := a.readState()
+	if err != nil && !errors.Is(err, errStateCorrupt) {
+		// файл не прочитать прямо сейчас — не сохраняем, чтобы не затереть его пустым
+		a.Log.Warnf("state.json не прочитать (%v) — состояние не сохранено", err)
+		return
+	}
 	if err != nil {
 		// испорченный файл не затираем молча: откладываем копию для разбора
 		bad := a.path(fmt.Sprintf("state.json.corrupt-%s", time.Now().Format("20060102-150405")))
@@ -314,8 +333,8 @@ func (a *App) updateState(fn func(*State)) {
 		a.Log.Warnf("state.json не сохранён: %v", err)
 		return
 	}
-	if err := writeFileAtomic(a.path("state.json"), data); err != nil {
-		a.Log.Debugf("state.json не сохранён: %v", err)
+	if err := writeFileReplace(a.path("state.json"), data); err != nil {
+		a.Log.Warnf("state.json не сохранён: %v", err)
 	}
 }
 
@@ -457,7 +476,24 @@ func dirExists(p string) bool {
 
 // writeFileAtomic пишет во временный файл рядом (уникальное имя — два процесса не
 // мешают друг другу), сбрасывает на диск и переименовывает поверх.
+// Если заменить не удалось (файл держит открытым winws), пишет поверх — так списки
+// обновляются и при работающем zapret.
 func writeFileAtomic(p string, data []byte) error {
+	return writeFileTemp(p, data, true)
+}
+
+// writeFileReplace — как writeFileAtomic, но никогда не пишет поверх: файл либо
+// заменяется целиком, либо остаётся прежним. Для state.json, который другой процесс
+// читает без блокировки, — иначе он прочитал бы половину файла.
+func writeFileReplace(p string, data []byte) error {
+	return writeFileTemp(p, data, false)
+}
+
+// renameRetries — замену ненадолго блокирует читатель (Go открывает файлы без
+// FILE_SHARE_DELETE): несколько попыток с паузой.
+const renameRetries = 20
+
+func writeFileTemp(p string, data []byte, overwriteFallback bool) error {
 	dir := filepath.Dir(p)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -478,12 +514,21 @@ func writeFileAtomic(p string, data []byte) error {
 		_ = os.Remove(tmp)
 		return werr
 	}
-	if err := os.Rename(tmp, p); err != nil {
-		_ = os.Remove(tmp)
-		// файл может быть занят (winws держит списки открытыми) — пишем поверх
-		return os.WriteFile(p, data, 0o644)
+	var rerr error
+	for i := range renameRetries {
+		if rerr = os.Rename(tmp, p); rerr == nil {
+			return nil
+		}
+		if i < renameRetries-1 {
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
-	return nil
+	_ = os.Remove(tmp) // best effort: временный файл больше не нужен
+	if !overwriteFallback {
+		return rerr
+	}
+	// файл может быть занят (winws держит списки открытыми) — пишем поверх
+	return os.WriteFile(p, data, 0o644)
 }
 
 func copyFile(src, dst string) error {
