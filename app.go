@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -346,6 +347,11 @@ const lockPollInterval = 500 * time.Millisecond
 // Держит процесс; при его падении Windows закрывает дескриптор и блокировка снимается.
 // timeout 0 — одна попытка. onWait вызывается один раз, если пришлось ждать.
 func acquireFileLock(p string, timeout time.Duration, onWait func()) (release func(), err error) {
+	return acquireFileLockCtx(context.Background(), p, timeout, onWait)
+}
+
+// acquireFileLockCtx — то же, но ожидание прерывается отменой ctx (Ctrl+C в консоли).
+func acquireFileLockCtx(ctx context.Context, p string, timeout time.Duration, onWait func()) (release func(), err error) {
 	name, err := windows.UTF16PtrFromString(p)
 	if err != nil {
 		return nil, err
@@ -368,19 +374,31 @@ func acquireFileLock(p string, timeout time.Duration, onWait func()) (release fu
 			onWait()
 			waited = true
 		}
-		time.Sleep(lockPollInterval)
+		if err := sleepCtx(ctx, lockPollInterval); err != nil {
+			return nil, err
+		}
 	}
 }
 
 // withLock — общая блокировка долгих операций (подбор, обновление, смена стратегии)
 // между службой и консольными командами.
 func (a *App) withLock(timeout time.Duration, fn func() error) error {
+	return a.withLockCtx(context.Background(), timeout, fn)
+}
+
+// cliLockTimeout — сколько консольная команда ждёт службу. Полный подбор идёт дольше
+// 3 минут (десятки стратегий × запуск winws и проверка), поэтому ждём с запасом;
+// прервать ожидание можно Ctrl+C.
+const cliLockTimeout = 20 * time.Minute
+
+// withLockCtx — withLock, ожидание которого прерывается отменой ctx.
+func (a *App) withLockCtx(ctx context.Context, timeout time.Duration, fn func() error) error {
 	if err := os.MkdirAll(a.Root, 0o755); err != nil {
 		return err
 	}
-	release, err := acquireFileLock(a.path(".lock"), timeout, func() {
+	release, err := acquireFileLockCtx(ctx, a.path(".lock"), timeout, func() {
 		if timeout > 5*time.Second {
-			a.Log.Infof("жду, пока служба закончит текущую операцию…")
+			a.Log.Infof("жду, пока служба закончит текущую операцию (подбор занимает несколько минут; Ctrl+C — отменить)…")
 		}
 	})
 	if err != nil {

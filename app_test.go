@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -296,5 +297,24 @@ func TestWriteFileReplaceNeverOverwritesInPlace(t *testing.T) {
 	}
 	if m, _ := filepath.Glob(filepath.Join(dir, "*.tmp")); len(m) != 0 {
 		t.Fatalf("остался временный файл: %v", m)
+	}
+}
+
+func TestWithLockCtxCancelStopsWaiting(t *testing.T) {
+	a := testApp(t)
+	release, err := acquireFileLock(a.path(".lock"), 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = a.withLockCtx(ctx, time.Minute, func() error { return nil })
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ждал отмену, получил %v", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatal("ожидание не прервалось отменой")
 	}
 }

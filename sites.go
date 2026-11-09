@@ -517,7 +517,7 @@ func cmdSites(ctx context.Context, a *App, args []string) int {
 	}
 	var msgs []string
 	changed := false
-	err = a.withLock(3*time.Minute, func() error {
+	err = a.withLockCtx(ctx, cliLockTimeout, func() error {
 		var err error
 		msgs, changed, err = a.applySites(ctx, p)
 		return err

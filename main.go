@@ -224,7 +224,7 @@ func cmdInstall(ctx context.Context, a *App, args []string) int {
 	a.reloadConfig()
 
 	var previousDir string
-	err = a.withLock(3*time.Minute, func() error {
+	err = a.withLockCtx(ctx, cliLockTimeout, func() error {
 		oldDir, oldStrategy := a.currentInstall()
 		defer func() { previousDir = oldDir }()
 		if *fromFlag != "" {
@@ -563,7 +563,7 @@ func cmdSelect(ctx context.Context, a *App, args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	err := a.withLock(3*time.Minute, func() error {
+	err := a.withLockCtx(ctx, cliLockTimeout, func() error {
 		relDir, current := a.currentInstall()
 		if relDir == "" {
 			return errors.New("zapret не установлен — сначала zapret-manager install")
@@ -599,7 +599,7 @@ func cmdUse(ctx context.Context, a *App, args []string) int {
 		return 2
 	}
 	name := strings.Join(args, " ")
-	err := a.withLock(3*time.Minute, func() error {
+	err := a.withLockCtx(ctx, cliLockTimeout, func() error {
 		relDir, _ := a.currentInstall()
 		if relDir == "" {
 			return errors.New("zapret не установлен — сначала zapret-manager install")
@@ -682,7 +682,7 @@ func cmdUpdate(ctx context.Context, a *App, args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	err := a.withLock(3*time.Minute, func() error {
+	err := a.withLockCtx(ctx, cliLockTimeout, func() error {
 		a.updateAll(ctx, true, *force)
 		return nil
 	})
@@ -694,7 +694,7 @@ func cmdUpdate(ctx context.Context, a *App, args []string) int {
 
 func cmdHosts(ctx context.Context, a *App, _ []string) int {
 	var changed bool
-	err := a.withLock(3*time.Minute, func() error {
+	err := a.withLockCtx(ctx, cliLockTimeout, func() error {
 		var err error
 		changed, err = a.updateHosts(ctx)
 		return err
@@ -727,7 +727,7 @@ func parseOffMinutes(s string) (time.Duration, error) {
 	return time.Duration(m) * time.Minute, nil
 }
 
-func cmdOff(_ context.Context, a *App, args []string) int {
+func cmdOff(ctx context.Context, a *App, args []string) int {
 	until := time.Date(9999, 1, 1, 0, 0, 0, 0, time.Local)
 	if len(args) > 0 {
 		d, err := parseOffMinutes(args[0])
@@ -737,7 +737,7 @@ func cmdOff(_ context.Context, a *App, args []string) int {
 		}
 		until = time.Now().Add(d)
 	}
-	err := a.withLock(3*time.Minute, func() error {
+	err := a.withLockCtx(ctx, cliLockTimeout, func() error {
 		// паузу ставим до остановки: иначе сторож может успеть поднять службу обратно
 		a.updateState(func(st *State) { st.PausedUntil = until })
 		if err := stopService(zapretSvcName, 15*time.Second); err != nil {
@@ -762,7 +762,7 @@ func cmdOff(_ context.Context, a *App, args []string) int {
 }
 
 func cmdOn(ctx context.Context, a *App, _ []string) int {
-	err := a.withLock(3*time.Minute, func() error {
+	err := a.withLockCtx(ctx, cliLockTimeout, func() error {
 		a.updateState(func(st *State) { st.PausedUntil = time.Time{} })
 		_ = setServiceStartType(zapretSvcName, mgr.StartAutomatic)
 		return startService(zapretSvcName)
