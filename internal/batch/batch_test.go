@@ -113,6 +113,48 @@ func TestNaturalOrder(t *testing.T) {
 	}
 }
 
+// Строка запуска — первая с аргументами: taskkill /IM "winws.exe" выше её не мешает.
+func TestExtractWinwsArgsSkipsLinesWithoutArgs(t *testing.T) {
+	bat := "taskkill /IM \"winws.exe\" /F >nul 2>&1\r\nstart \"\" \"%BIN%winws.exe\" --a=1\r\n"
+	args, err := ExtractWinwsArgs(bat, sampleVars, `C:\`)
+	if err != nil || args != "--a=1" {
+		t.Fatalf("got %q, %v", args, err)
+	}
+}
+
+// Перенаправления и разделители команд — не аргументы winws.
+func TestExtractWinwsArgsCutsOperators(t *testing.T) {
+	cases := map[string]string{
+		`start "" "winws.exe" --a=1 >nul 2>&1`:          "--a=1",
+		`start "" "winws.exe" --a=1 2>nul`:              "--a=1",
+		`start "" "winws.exe" --a=1 & echo done`:        "--a=1",
+		`start "" "winws.exe" --a=1 | more`:             "--a=1",
+		`start "" "winws.exe" --a=x^&y --b="p&q" --c=2`: `--a=x&y --b="p&q" --c=2`,
+		`start "" "winws.exe" --ports=1,2>nul`:          "--ports=1,2",
+	}
+	for in, want := range cases {
+		if got, err := ExtractWinwsArgs(in, nil, `C:\`); err != nil || got != want {
+			t.Errorf("%q → %q, %v; want %q", in, got, err, want)
+		}
+	}
+}
+
+func TestExtractWinwsArgsRemVariants(t *testing.T) {
+	if !isComment("rem") || !isComment("@rem") {
+		t.Error("пустой rem — комментарий")
+	}
+	for _, c := range []string{"rem\t", "REM.", "@REM ", "  :: "} {
+		bat := c + `start "" "winws.exe" --bad=1` + "\r\n" + `start "" "winws.exe" --good=1`
+		if got, err := ExtractWinwsArgs(bat, nil, `C:\`); err != nil || got != "--good=1" {
+			t.Errorf("комментарий %q: got %q, %v", c, got, err)
+		}
+	}
+	// «remark» — не комментарий
+	if got, _ := ExtractWinwsArgs(`remark "winws.exe" --x=1`, nil, `C:\`); got != "--x=1" {
+		t.Errorf("remark: %q", got)
+	}
+}
+
 func TestExeFromCmdline(t *testing.T) {
 	cases := map[string]string{
 		`"C:\a b\bin\winws.exe" --wf-tcp=80`:     `C:\a b\bin\winws.exe`,
@@ -121,6 +163,8 @@ func TestExeFromCmdline(t *testing.T) {
 		`"C:\unterminated`:                       `C:\unterminated`,
 		`  `:                                     ``,
 		`plain arg`:                              `plain`,
+		`C:\a.exe-tools\winws.exe --x`:           `C:\a.exe-tools\winws.exe`,
+		`C:\a.EXE`:                               `C:\a.EXE`,
 	}
 	for in, want := range cases {
 		if got := ExeFromCmdline(in); got != want {
@@ -137,6 +181,7 @@ func FuzzExtractWinwsArgs(f *testing.F) {
 	f.Add("start \"\" \"x\\winws.exe\" --a=1 ^^\r\n--b=2\r\n")
 	f.Add("\"winws.exe\" --x=%BIN% ^")
 	f.Add("%%%~dp0%%bin%")
+	f.Add("taskkill /IM \"winws.exe\"\r\n\"winws.exe\" --a=\"x&y\" ^& >nul 2>&1 | z")
 	f.Fuzz(func(t *testing.T, content string) {
 		args, err := ExtractWinwsArgs(content, sampleVars, `C:\r\`)
 		if err != nil {
