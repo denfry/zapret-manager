@@ -261,7 +261,7 @@ func finalPathOf(p string) (string, error) {
 
 func finalPathByHandle(h windows.Handle) (string, error) {
 	buf := make([]uint16, windows.MAX_LONG_PATH)
-	n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 0)
+	n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 0) // #nosec G115 -- len(buf) == MAX_LONG_PATH (32768)
 	if err != nil {
 		return "", err
 	}
