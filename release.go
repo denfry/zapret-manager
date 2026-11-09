@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -50,12 +51,30 @@ type downloader struct {
 	client   *http.Client
 	attempts int
 	backoff  time.Duration // первая пауза; дальше ×2 плюс случайная добавка до backoff/2
+	stall    time.Duration // сколько ждать следующих байт тела; 0 — defaultStall
 }
+
+const (
+	// defaultStall — тело перестало приходить: соединение считаем зависшим.
+	defaultStall = time.Minute
+	// minRate — скорость, ниже которой ответ целиком уже не ждём: общий срок запроса
+	// считается от размера лимита (релиз 100 МБ — около получаса), а не один на всё,
+	// иначе на медленном канале релиз обрывался бы всегда в одном месте.
+	minRate = 64 << 10
+	// baseRequestTimeout — на соединение, заголовки и небольшие файлы.
+	baseRequestTimeout = 3 * time.Minute
+)
+
+var (
+	errStalled        = errors.New("загрузка встала: данные не приходят")
+	errUnsafeRedirect = errors.New("небезопасный редирект")
+	errSink           = errors.New("не записать скачанное")
+)
 
 func newDownloader() *downloader {
 	return &downloader{
 		client: &http.Client{
-			Timeout: 3 * time.Minute, // на весь запрос вместе с телом
+			// без общего Timeout: срок запроса задаёт fetchOnce по размеру ответа
 			Transport: &http.Transport{
 				Proxy:                 http.ProxyFromEnvironment,
 				DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -79,10 +98,10 @@ var defaultDownloader = newDownloader()
 // httpsOnlyRedirect не даёт GitHub-редиректу увести запрос на http:// и ограничивает цепочку.
 func httpsOnlyRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= maxRedirects {
-		return fmt.Errorf("больше %d редиректов", maxRedirects)
+		return fmt.Errorf("%w: больше %d редиректов", errUnsafeRedirect, maxRedirects)
 	}
 	if req.URL.Scheme != "https" {
-		return fmt.Errorf("редирект на небезопасный адрес %s отклонён", req.URL.Redacted())
+		return fmt.Errorf("%w: адрес %s отклонён", errUnsafeRedirect, req.URL.Redacted())
 	}
 	return nil
 }
@@ -92,7 +111,36 @@ func retryable(err error) bool {
 		return se.Code == http.StatusRequestTimeout || se.Code == http.StatusTooEarly ||
 			se.Code == http.StatusTooManyRequests || se.Code >= 500
 	}
-	return !errors.Is(err, errTooLarge)
+	// Не повторяем то, что повтор не исправит: лимит, отклонённый редирект, неверный
+	// сертификат, ошибку записи на диск. Остальное — сбои сети, их повторяем.
+	if errors.Is(err, errTooLarge) || errors.Is(err, errUnsafeRedirect) || errors.Is(err, errSink) {
+		return false
+	}
+	var certErr *tls.CertificateVerificationError
+	var uaErr x509.UnknownAuthorityError
+	var hostErr x509.HostnameError
+	var invErr x509.CertificateInvalidError
+	return !errors.As(err, &certErr) && !errors.As(err, &uaErr) && !errors.As(err, &hostErr) && !errors.As(err, &invErr)
+}
+
+// requestTimeout — общий срок одного запроса с телом не больше limit байт.
+func requestTimeout(limit int64) time.Duration {
+	return baseRequestTimeout + time.Duration(limit/minRate)*time.Second
+}
+
+// stallReader отменяет запрос, если между порциями тела прошло больше stall.
+type stallReader struct {
+	r     io.Reader
+	timer *time.Timer
+	stall time.Duration
+}
+
+func (s *stallReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if n > 0 {
+		s.timer.Reset(s.stall)
+	}
+	return n, err
 }
 
 func (d *downloader) delay(attempt int) time.Duration {
@@ -126,6 +174,24 @@ func (d *downloader) fetch(ctx context.Context, url string, limit int64, sink fu
 }
 
 func (d *downloader) fetchOnce(ctx context.Context, url string, limit int64, sink func(io.Reader) error) error {
+	ctx, cancelTimeout := context.WithTimeout(ctx, requestTimeout(limit))
+	defer cancelTimeout()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stall := d.stall
+	if stall <= 0 {
+		stall = defaultStall
+	}
+	timer := time.AfterFunc(stall, func() { cancel(errStalled) })
+	defer timer.Stop()
+	err := d.fetchBody(ctx, url, limit, timer, stall, sink)
+	if err != nil && errors.Is(context.Cause(ctx), errStalled) {
+		return fmt.Errorf("%s: %w", url, errStalled)
+	}
+	return err
+}
+
+func (d *downloader) fetchBody(ctx context.Context, url string, limit int64, timer *time.Timer, stall time.Duration, sink func(io.Reader) error) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -144,9 +210,13 @@ func (d *downloader) fetchOnce(ctx context.Context, url string, limit int64, sin
 	if resp.ContentLength > limit {
 		return fmt.Errorf("%s: %w (%d > %d байт)", url, errTooLarge, resp.ContentLength, limit)
 	}
-	cr := &countingReader{r: io.LimitReader(resp.Body, limit+1)}
+	timer.Reset(stall)
+	cr := &countingReader{r: &stallReader{r: io.LimitReader(resp.Body, limit+1), timer: timer, stall: stall}}
 	if err := sink(cr); err != nil {
-		return err
+		if cr.err != nil {
+			return err // оборвалось чтение из сети — это можно повторить
+		}
+		return fmt.Errorf("%w: %w", errSink, err)
 	}
 	if cr.n > limit {
 		return fmt.Errorf("%s: %w (%d байт)", url, errTooLarge, limit)
@@ -155,13 +225,17 @@ func (d *downloader) fetchOnce(ctx context.Context, url string, limit int64, sin
 }
 
 type countingReader struct {
-	r io.Reader
-	n int64
+	r   io.Reader
+	n   int64
+	err error // последняя ошибка чтения, кроме EOF: отличает сбой сети от сбоя sink
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n += int64(n)
+	if err != nil && !errors.Is(err, io.EOF) {
+		c.err = err
+	}
 	return n, err
 }
 

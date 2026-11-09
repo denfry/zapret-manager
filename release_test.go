@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -176,15 +179,76 @@ func TestBackoffDelayGrows(t *testing.T) {
 
 func TestRetryable(t *testing.T) {
 	cases := map[error]bool{
-		&httpStatusError{Code: 500}:    true,
-		&httpStatusError{Code: 429}:    true,
-		&httpStatusError{Code: 404}:    false,
-		errTooLarge:                    false,
-		errors.New("connection reset"): true,
+		&httpStatusError{Code: 500}:              true,
+		&httpStatusError{Code: 429}:              true,
+		&httpStatusError{Code: 404}:              false,
+		errTooLarge:                              false,
+		errors.New("connection reset"):           true,
+		fmt.Errorf("x: %w", errStalled):          true,
+		fmt.Errorf("Get: %w", errUnsafeRedirect): false,
+		fmt.Errorf("%w: disk full", errSink):     false,
+		&tls.CertificateVerificationError{}:      false,
+		x509.UnknownAuthorityError{}:             false,
 	}
 	for err, want := range cases {
 		if got := retryable(err); got != want {
 			t.Errorf("retryable(%v) = %v", err, got)
 		}
+	}
+}
+
+// Тело перестало приходить — запрос обрывается через stall, а не висит до общего срока,
+// и повторяется (это сбой сети).
+func TestDownloaderStall(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Length", "1000")
+		_, _ = w.Write([]byte("partial"))
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}))
+	defer srv.Close()
+	d := testDownloader(srv, time.Millisecond)
+	d.client.Timeout = 0
+	d.stall = 200 * time.Millisecond
+	start := time.Now()
+	_, err := d.get(context.Background(), srv.URL, 1<<20)
+	if !errors.Is(err, errStalled) {
+		t.Fatalf("ждал errStalled, получил %v", err)
+	}
+	if hits.Load() != 3 {
+		t.Fatalf("попыток %d, ждал 3", hits.Load())
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("обрыв по зависанию слишком долгий: %v", time.Since(start))
+	}
+}
+
+// Медленная, но идущая загрузка не обрывается: срок считается от размера.
+func TestRequestTimeoutScalesWithLimit(t *testing.T) {
+	if got := requestTimeout(maxReleaseZip); got < 25*time.Minute {
+		t.Fatalf("на релиз %v — мало для медленного канала", got)
+	}
+	if got := requestTimeout(64 << 10); got > 4*time.Minute {
+		t.Fatalf("на маленький файл %v — много", got)
+	}
+}
+
+// Ошибка записи на диск не повторяется.
+func TestDownloaderSinkErrorNotRetried(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte("data"))
+	}))
+	defer srv.Close()
+	d := testDownloader(srv, time.Millisecond)
+	err := d.download(context.Background(), srv.URL, filepath.Join(t.TempDir(), "no", "such", "dir", "f"), 1<<20)
+	if !errors.Is(err, errSink) || hits.Load() != 1 {
+		t.Fatalf("err=%v, попыток %d", err, hits.Load())
 	}
 }
