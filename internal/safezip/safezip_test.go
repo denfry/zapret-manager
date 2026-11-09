@@ -35,6 +35,39 @@ func makeZip(t *testing.T, files map[string]string) string {
 	return p
 }
 
+// Папка, записанная архиватором Windows как «top\sub\», — папка, а не пустой файл.
+func TestExtractBackslashDirEntry(t *testing.T) {
+	z := makeZip(t, map[string]string{`top\sub\`: "", `top\sub\file.txt`: "x"})
+	dest := filepath.Join(t.TempDir(), "out")
+	if err := Extract(z, dest, DefaultLimits); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(dest, "sub", "file.txt")); err != nil || string(data) != "x" {
+		t.Fatalf("%q %v", data, err)
+	}
+}
+
+// Заявленный размер больше лимита — отказ до распаковки, на диск ничего не пишется.
+func TestExtractRejectsDeclaredTotalUpFront(t *testing.T) {
+	z := makeZip(t, map[string]string{"a.txt": strings.Repeat("a", 600), "b.txt": strings.Repeat("b", 600)})
+	dest := filepath.Join(t.TempDir(), "out")
+	lim := DefaultLimits
+	lim.MaxTotalBytes = 1000
+	if err := Extract(z, dest, lim); !errors.Is(err, ErrLimit) {
+		t.Fatalf("ждал ErrLimit, получил %v", err)
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("на диск что-то записано: %v", err)
+	}
+}
+
+func TestEntryPathDriveRoot(t *testing.T) {
+	got, err := EntryPath(`C:\`, "x/file.txt", "")
+	if err != nil || got != `C:\x\file.txt` {
+		t.Fatalf("%q %v", got, err)
+	}
+}
+
 func TestExtractStripsTopDir(t *testing.T) {
 	p := makeZip(t, map[string]string{
 		"zapret-discord-youtube-1.10.5/service.bat":       "x",

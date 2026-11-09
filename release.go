@@ -428,8 +428,14 @@ func (a *App) pruneReleases(current string) {
 			continue
 		}
 		name := e.Name()
-		if strings.HasSuffix(name, ".new") || strings.HasSuffix(name, ".old") {
-			_ = os.RemoveAll(filepath.Join(a.releasesDir(), name))
+		// трогаем только свои папки: releases\<версия>[-время] и их .new/.old;
+		// всё остальное (папку, положенную руками) не удаляем
+		base := strings.TrimSuffix(strings.TrimSuffix(name, ".new"), ".old")
+		if !version.Valid(base) {
+			continue
+		}
+		if base != name {
+			_ = os.RemoveAll(filepath.Join(a.releasesDir(), name)) // best effort: недокачанная или старая копия
 			continue
 		}
 		vers = append(vers, name)
@@ -492,7 +498,11 @@ func (a *App) updateMainLists(ctx context.Context, relDir string) ([]string, err
 			continue
 		}
 		target := filepath.Join(relDir, "lists", name)
-		old, _ := os.ReadFile(target)
+		old, err := os.ReadFile(target)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, name+": "+err.Error())
+			continue
+		}
 		content := strings.Join(lines, "\r\n") + "\r\n"
 		if textutil.NormalizeText(string(old)) == textutil.NormalizeText(content) {
 			continue

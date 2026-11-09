@@ -42,6 +42,15 @@ func Extract(zipPath, dest string, lim Limits) error {
 	if len(zr.File) > lim.MaxFiles {
 		return fmt.Errorf("%w: %d файлов (максимум %d)", ErrLimit, len(zr.File), lim.MaxFiles)
 	}
+	// Заявленные размеры проверяем до распаковки, чтобы не писать на диск сотни МБ
+	// впустую; настоящие байты всё равно считаются ниже (заголовок может врать).
+	var declared uint64
+	for _, f := range zr.File {
+		declared += f.UncompressedSize64
+		if lim.MaxTotalBytes < 0 || declared > uint64(lim.MaxTotalBytes) { // #nosec G115 -- checked non-negative
+			return fmt.Errorf("%w: в архиве больше %d байт", ErrLimit, lim.MaxTotalBytes)
+		}
+	}
 	prefix := commonPrefix(zr.File)
 	var total int64
 	for _, f := range zr.File {
@@ -52,7 +61,8 @@ func Extract(zipPath, dest string, lim Limits) error {
 		if target == "" {
 			continue
 		}
-		if f.FileInfo().IsDir() {
+		// папка: «/» в конце (стандарт) или «\» (так пишут некоторые архиваторы Windows)
+		if f.FileInfo().IsDir() || strings.HasSuffix(f.Name, `\`) {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
@@ -98,7 +108,11 @@ func EntryPath(dest, name, prefix string) (string, error) {
 	}
 	root := filepath.Clean(dest)
 	target := filepath.Join(root, filepath.FromSlash(path.Clean(n)))
-	if !strings.HasPrefix(strings.ToLower(target), strings.ToLower(root+string(os.PathSeparator))) {
+	rootPrefix := root
+	if !strings.HasSuffix(rootPrefix, string(os.PathSeparator)) { // C:\ уже кончается разделителем
+		rootPrefix += string(os.PathSeparator)
+	}
+	if !strings.HasPrefix(strings.ToLower(target), strings.ToLower(rootPrefix)) {
 		return "", fmt.Errorf("путь вне папки распаковки: %q", name)
 	}
 	return target, nil

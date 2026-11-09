@@ -218,6 +218,11 @@ func TestUpdateFlowOffline(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(a.releasesDir(), "1.10.5.new"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// папка, положенная руками, — не релиз: её не трогаем
+	manual := filepath.Join(a.releasesDir(), "backup")
+	if err := os.MkdirAll(manual, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	a.Cfg.KeepVersions = 1
 	a.pruneReleases(oldDir)
 	left, _ := os.ReadDir(a.releasesDir())
@@ -225,7 +230,7 @@ func TestUpdateFlowOffline(t *testing.T) {
 	for _, e := range left {
 		names = append(names, e.Name())
 	}
-	if len(names) != 2 || !dirExists(oldDir) || !dirExists(forced) {
+	if len(names) != 3 || !dirExists(oldDir) || !dirExists(forced) || !dirExists(manual) {
 		t.Fatalf("после очистки: %v", names)
 	}
 }

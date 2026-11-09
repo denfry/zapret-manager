@@ -57,22 +57,25 @@ func (a *App) updateHosts(ctx context.Context) (bool, error) {
 func (a *App) writeHosts(old []byte, content string) error {
 	p := hostsPath()
 	if len(old) > 0 {
-		backup := a.path("backups", "hosts-"+time.Now().Format("20060102-150405")+".bak")
+		// миллисекунды: две записи за секунду не должны затирать копию исходного hosts
+		backup := a.path("backups", "hosts-"+time.Now().Format("20060102-150405.000")+".bak")
 		if err := os.MkdirAll(filepath.Dir(backup), 0o755); err != nil {
 			return fmt.Errorf("копия hosts: %w", err)
 		}
-		if err := os.WriteFile(backup, old, 0o644); err != nil {
+		if err := writeFileReplace(backup, old); err != nil {
 			return fmt.Errorf("копия hosts: %w", err)
 		}
 		a.pruneBackups()
 	}
-	err := os.WriteFile(p, []byte(content), 0o644)
+	// через временный файл и замену: сбой посреди записи не оставит hosts обрезанным
+	// (если заменить нельзя — файл занят, — writeFileAtomic пишет поверх)
+	err := writeFileAtomic(p, []byte(content))
 	if err != nil {
 		// бывает, что hosts помечен «только чтение»
 		pp, _ := windows.UTF16PtrFromString(p)
 		if attrs, aerr := windows.GetFileAttributes(pp); aerr == nil && attrs&windows.FILE_ATTRIBUTE_READONLY != 0 {
 			_ = windows.SetFileAttributes(pp, attrs&^windows.FILE_ATTRIBUTE_READONLY)
-			err = os.WriteFile(p, []byte(content), 0o644)
+			err = writeFileAtomic(p, []byte(content))
 			_ = windows.SetFileAttributes(pp, attrs)
 		}
 	}
