@@ -130,21 +130,23 @@ func (c *Config) normalize() []string {
 
 // State — что менеджер помнит между запусками (state.json).
 type State struct {
-	ReleaseDir      string        `json:"release_dir,omitempty"`
-	Version         string        `json:"version,omitempty"`
-	Strategy        string        `json:"strategy,omitempty"`
-	LatestVersion   string        `json:"latest_version,omitempty"`
-	LastUpdateCheck time.Time     `json:"last_update_check"`
-	LastIpsetUpdate time.Time     `json:"last_ipset_update"`
-	LastListsUpdate time.Time     `json:"last_lists_update"`
-	LastHostsUpdate time.Time     `json:"last_hosts_update"`
-	LastHeal        time.Time     `json:"last_heal"`
-	HealStreak      int           `json:"heal_streak"` // сколько подборов подряд не нашли рабочую стратегию
-	LastDNSWarn     time.Time     `json:"last_dns_warn"`
-	PausedUntil     time.Time     `json:"paused_until"`
-	BadVersions     []string      `json:"bad_versions,omitempty"`
-	LastCheck       *CheckSummary `json:"last_check,omitempty"`
-	LastSweep       *SweepSummary `json:"last_sweep,omitempty"`
+	ReleaseDir      string    `json:"release_dir,omitempty"`
+	Version         string    `json:"version,omitempty"`
+	Strategy        string    `json:"strategy,omitempty"`
+	LatestVersion   string    `json:"latest_version,omitempty"`
+	LastUpdateCheck time.Time `json:"last_update_check"`
+	LastIpsetUpdate time.Time `json:"last_ipset_update"`
+	LastListsUpdate time.Time `json:"last_lists_update"`
+	LastHostsUpdate time.Time `json:"last_hosts_update"`
+	LastHeal        time.Time `json:"last_heal"`
+	HealStreak      int       `json:"heal_streak"` // сколько подборов подряд не нашли рабочую стратегию
+	LastDNSWarn     time.Time `json:"last_dns_warn"`
+	PausedUntil     time.Time `json:"paused_until"`
+	BadVersions     []string  `json:"bad_versions,omitempty"`
+	// BadVersionTimes — когда версию откатили; через badVersionTTL её попробуют снова.
+	BadVersionTimes map[string]time.Time `json:"bad_version_times,omitempty"`
+	LastCheck       *CheckSummary        `json:"last_check,omitempty"`
+	LastSweep       *SweepSummary        `json:"last_sweep,omitempty"`
 }
 
 type CheckSummary struct {

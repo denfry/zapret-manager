@@ -524,7 +524,9 @@ func (a *App) heal(ctx context.Context, rep *HealthReport) {
 		return
 	}
 	a.Log.Eventf("не работает (%s): %s — перезапускаю zapret", rep.shortText(), strings.Join(rep.failures(), "; "))
-	_ = stopService(zapretSvcName, 15*time.Second)
+	if err := stopService(zapretSvcName, 15*time.Second); err != nil {
+		a.Log.Warnf("остановка zapret: %v", err)
+	}
 	killProcesses("winws.exe")
 	if err := startService(zapretSvcName); err != nil {
 		a.Log.Warnf("перезапуск zapret: %v", err)
@@ -596,12 +598,19 @@ func (a *App) updateRelease(ctx context.Context, force bool) error {
 		cur = releaseVersion(relDir)
 	}
 	st := a.loadState()
-	if !force && cur != "" && version.Compare(latest, cur) <= 0 {
+	// версия по имени папки releases\<версия> — то, что мы скачали: если service.bat
+	// релиза отстаёт от version.txt, иначе качали бы ту же версию снова и снова
+	dirVer := ""
+	if relDir != "" {
+		dirVer = version.FromDirName(filepath.Base(relDir))
+	}
+	if !force && cur != "" && (version.Compare(latest, cur) <= 0 || dirVer == latest) {
 		a.Log.Infof("zapret %s — последняя версия", cur)
 		return nil
 	}
-	if !force && slices.Contains(st.BadVersions, latest) {
-		a.Log.Infof("версия %s уже откатывалась как нерабочая — пропускаю (update --force поставит)", latest)
+	if !force && a.badVersionActive(st, latest) {
+		a.Log.Infof("версия %s откатывалась как нерабочая — пропускаю до %s (update --force поставит)",
+			latest, badUntil(st, latest).Format("02.01 15:04"))
 		return nil
 	}
 	if cur != "" && cur != latest {
@@ -666,7 +675,7 @@ func (a *App) updateRelease(ctx context.Context, force bool) error {
 		if err := a.applyStrategy(relDir, strategy); err != nil {
 			return fmt.Errorf("откат не удался: %w", err)
 		}
-		a.updateState(func(st *State) { st.BadVersions = appendUnique(st.BadVersions, latest) })
+		a.updateState(func(st *State) { markBadVersion(st, latest, time.Now()) })
 		return errors.New("новая версия хуже — оставил прежнюю")
 	}
 	_, nowStrategy := a.currentInstall()
@@ -742,6 +751,49 @@ func (a *App) updateAll(ctx context.Context, manual, force bool) {
 		}
 	}
 	a.updateState(func(st *State) { st.LastUpdateCheck = time.Now() })
+}
+
+// ---------- нерабочие версии ----------
+
+// badVersionTTL — сколько не ставить версию, которую откатили как нерабочую. Замер мог
+// случиться в неудачную минуту (сбой сети, лёг Discord), поэтому не навсегда.
+const badVersionTTL = 3 * 24 * time.Hour
+
+func markBadVersion(st *State, v string, now time.Time) {
+	st.BadVersions = appendUnique(st.BadVersions, v)
+	if st.BadVersionTimes == nil {
+		st.BadVersionTimes = map[string]time.Time{}
+	}
+	st.BadVersionTimes[v] = now
+}
+
+// badUntil — до какого времени версия v считается нерабочей (нулевое — не считается).
+// У записей из старых state.json времени нет: срок для них отсчитывается с первой
+// проверки (badVersionActive его записывает).
+func badUntil(st State, v string) time.Time {
+	if !slices.Contains(st.BadVersions, v) {
+		return time.Time{}
+	}
+	t, ok := st.BadVersionTimes[v]
+	if !ok {
+		t = time.Now()
+	}
+	return t.Add(badVersionTTL)
+}
+
+func (a *App) badVersionActive(st State, v string) bool {
+	if !slices.Contains(st.BadVersions, v) {
+		return false
+	}
+	if _, ok := st.BadVersionTimes[v]; !ok {
+		a.updateState(func(s *State) {
+			if _, ok := s.BadVersionTimes[v]; !ok && slices.Contains(s.BadVersions, v) {
+				markBadVersion(s, v, time.Now())
+			}
+		})
+		return true
+	}
+	return time.Now().Before(badUntil(st, v))
 }
 
 // ---------- мелочи ----------

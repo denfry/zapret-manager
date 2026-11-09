@@ -173,7 +173,7 @@ func (a *App) ensureRunning() {
 	}
 	_ = a.withLock(0, func() error {
 		info := queryService(zapretSvcName)
-		if !info.Exists || info.State == svc.Running {
+		if !info.Exists || info.State == svc.Running || info.State == svc.StartPending {
 			return nil
 		}
 		a.Log.Eventf("служба zapret была %s — запускаю", stateName(info.State))
@@ -209,7 +209,7 @@ func (a *App) periodicCheck(ctx context.Context, fails *int) time.Duration {
 				a.Log.Warnf("%v", err)
 				return nil
 			}
-		case info.State != svc.Running:
+		case info.State != svc.Running && info.State != svc.StartPending:
 			a.Log.Eventf("служба zapret была %s — запускаю", stateName(info.State))
 			if info.StartType == mgr.StartDisabled {
 				_ = setServiceStartType(zapretSvcName, mgr.StartAutomatic)

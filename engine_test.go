@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -124,5 +125,30 @@ func TestWasRunning(t *testing.T) {
 		if got := wasRunning(c.info); got != c.want {
 			t.Errorf("wasRunning(%+v) = %v, want %v", c.info, got, c.want)
 		}
+	}
+}
+
+func TestBadVersionExpires(t *testing.T) {
+	a := testApp(t)
+	var st State
+	now := time.Now()
+	markBadVersion(&st, "1.9.0", now.Add(-badVersionTTL-time.Hour))
+	markBadVersion(&st, "1.9.1", now)
+	if a.badVersionActive(st, "1.9.0") {
+		t.Error("срок вышел — версию можно пробовать снова")
+	}
+	if !a.badVersionActive(st, "1.9.1") {
+		t.Error("только что откаченная версия — пропускать")
+	}
+	if a.badVersionActive(st, "2.0") {
+		t.Error("чистая версия")
+	}
+	// запись из старого state.json без времени: пропускаем и запоминаем, с какого момента
+	a.updateState(func(s *State) { s.BadVersions = []string{"1.8"} })
+	if !a.badVersionActive(a.loadState(), "1.8") {
+		t.Error("старая запись без времени — пока пропускать")
+	}
+	if got := a.loadState().BadVersionTimes["1.8"]; got.IsZero() {
+		t.Error("время для старой записи не сохранено")
 	}
 }
