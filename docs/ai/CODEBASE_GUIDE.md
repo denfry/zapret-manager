@@ -7,7 +7,7 @@
 | I1 | Командная строка службы = то, что выполнил бы `.bat` (переменные, `^`, кавычки) | `internal/batch`, `buildCommandLine` | `TestExtractWinwsArgs`, `TestRealStrategies`, `TestMatchesServiceBatInstall`, `FuzzExtractWinwsArgs` |
 | I2 | Неизвестная `%VAR%` — ошибка, не пустая строка | `batch.ExpandVars` | `TestExtractWinwsArgsUnknownVar` |
 | I3 | Значения game filter в командной строке — только `[0-9,-]` | `zapretfmt.ValidatePortRanges` | `FuzzParseGameFilter` |
-| I4 | Служба zapret не остаётся со сломанным binPath | `applyStrategy` (откат), `selectStrategy` (defer) | ручной сценарий; см. TESTING_GUIDE |
+| I4 | Служба zapret не остаётся со сломанным binPath | `applyStrategy` → `rollbackZapret` (прежняя строка, а если службы не было — удаление), `selectStrategy` (defer: после успешной установки winws службы не трогает; поднимает службу, только если она работала — `wasRunning`) | `TestWasRunning`, ручной сценарий; см. TESTING_GUIDE |
 | I5 | У службы zapret нет recovery actions | `installZapretService` → `ResetRecoveryActions` | ревью |
 | I6 | Корневая папка: писать могут только SYSTEM и администраторы, владелец — администраторы | `secureTree`, `ensureRootSecure`, `install` | `TestSecureTreeLocksOutNonAdmins` |
 | I7 | Долгие операции под `.lock`, RMW state.json под `.state.lock` | `withLock`, `updateState` | `TestUpdateStateConcurrent`, `TestFileLockExcludesOtherHolders` |

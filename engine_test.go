@@ -3,6 +3,9 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
 )
 
 func TestSortRankingPrefersHealthyThenCurrent(t *testing.T) {
@@ -102,5 +105,24 @@ func TestRehealth(t *testing.T) {
 	e.Discord, e.YouTube = "6/6", "4/4" // их заполняет fill()
 	if s := e.groupsText(); s != "Discord 6/6, YouTube 4/4, Instagram 0/2 (zapret не помогает)" {
 		t.Fatalf("groupsText: %q", s)
+	}
+}
+
+func TestWasRunning(t *testing.T) {
+	cases := []struct {
+		info svcInfo
+		want bool
+	}{
+		{svcInfo{}, false},
+		{svcInfo{Exists: true, State: svc.Running}, true},
+		{svcInfo{Exists: true, State: svc.StartPending}, true},
+		// пауза (off) или выключена руками — после подбора не включаем
+		{svcInfo{Exists: true, State: svc.Stopped, StartType: mgr.StartManual}, false},
+		{svcInfo{Exists: true, State: svc.Stopped, StartType: mgr.StartAutomatic}, false},
+	}
+	for _, c := range cases {
+		if got := wasRunning(c.info); got != c.want {
+			t.Errorf("wasRunning(%+v) = %v, want %v", c.info, got, c.want)
+		}
 	}
 }

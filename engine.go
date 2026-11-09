@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
 
 	"zapret-manager/internal/batch"
 	"zapret-manager/internal/version"
@@ -91,14 +92,7 @@ func (a *App) applyStrategy(relDir, name string) error {
 		} else {
 			p.Stop()
 		}
-		// не оставляем службу со сломанной строкой — возвращаем прежнюю
-		if prev.Exists && prev.BinPath != "" && prev.BinPath != cmdline {
-			if rerr := installZapretService(prev.BinPath, prevStrategy); rerr == nil {
-				if serr := startService(zapretSvcName); serr == nil {
-					a.Log.Warnf("стратегия %s не запустилась — вернул прежнюю (%s)", s.Name, orDash(prevStrategy))
-				}
-			}
-		}
+		a.rollbackZapret(prev, prevStrategy, cmdline, s.Name, !samePath(oldDir, relDir))
 		return err
 	}
 	ver := releaseVersion(relDir)
@@ -107,6 +101,56 @@ func (a *App) applyStrategy(relDir, name string) error {
 	})
 	a.Log.Eventf("в службе zapret стратегия %s (zapret %s)", s.Name, ver)
 	return nil
+}
+
+// rollbackZapret не оставляет службу zapret со строкой, которая не стартует: возвращает
+// прежнюю (и запускает, если та работала), а если службы раньше не было — удаляет.
+// dirChanged — новая строка была из другой папки релиза: драйвер WinDivert успел
+// загрузиться оттуда, и прежнему winws его надо перезагрузить из своей.
+func (a *App) rollbackZapret(prev svcInfo, prevStrategy, failedCmdline, failedName string, dirChanged bool) {
+	if err := stopService(zapretSvcName, 15*time.Second); err != nil {
+		a.Log.Warnf("откат: %v", err)
+	}
+	killProcesses("winws.exe")
+	if !prev.Exists {
+		if err := deleteService(zapretSvcName); err != nil {
+			a.Log.Warnf("стратегия %s не запустилась, а службу zapret не удалить: %v", failedName, err)
+		} else {
+			a.Log.Warnf("стратегия %s не запустилась — службу zapret убрал", failedName)
+		}
+		return
+	}
+	if prev.BinPath == "" || prev.BinPath == failedCmdline {
+		return // возвращать нечего: прежняя строка та же самая
+	}
+	if dirChanged {
+		removeWinDivert()
+	}
+	if err := installZapretService(prev.BinPath, prevStrategy); err != nil {
+		a.Log.Warnf("стратегия %s не запустилась, и прежнюю (%s) вернуть не удалось: %v", failedName, orDash(prevStrategy), err)
+		return
+	}
+	if prev.StartType == mgr.StartManual || prev.StartType == mgr.StartDisabled {
+		if err := setServiceStartType(zapretSvcName, prev.StartType); err != nil {
+			a.Log.Warnf("откат: тип запуска zapret: %v", err)
+		}
+	}
+	if !wasRunning(prev) {
+		a.Log.Warnf("стратегия %s не запустилась — вернул прежнюю (%s), служба остаётся остановленной", failedName, orDash(prevStrategy))
+		return
+	}
+	if err := startService(zapretSvcName); err != nil {
+		a.Log.Warnf("стратегия %s не запустилась, прежняя (%s) возвращена, но не стартует: %v", failedName, orDash(prevStrategy), err)
+		return
+	}
+	a.Log.Warnf("стратегия %s не запустилась — вернул прежнюю (%s)", failedName, orDash(prevStrategy))
+}
+
+// wasRunning: служба работала (или запускалась) до того, как мы её тронули, — значит,
+// после неудачи её надо поднять обратно. Остановленную (пауза off, выключена руками)
+// не включаем.
+func wasRunning(prev svcInfo) bool {
+	return prev.Exists && (prev.State == svc.Running || prev.State == svc.StartPending)
 }
 
 // ---------- подбор ----------
@@ -396,8 +440,12 @@ func (a *App) selectStrategy(ctx context.Context, relDir, current string, o sele
 	killProcesses("winws.exe")
 	applied := false
 	defer func() {
-		killProcesses("winws.exe")
-		if !applied && prev.Exists && prev.StartType != 4 /* disabled */ {
+		// После applyStrategy winws.exe — это уже процесс службы zapret: его не трогаем.
+		if applied {
+			return
+		}
+		killProcesses("winws.exe") // тестовый winws подбора
+		if wasRunning(prev) {
 			if err := startService(zapretSvcName); err != nil {
 				a.Log.Warnf("не удалось вернуть службу zapret: %v", err)
 			}
