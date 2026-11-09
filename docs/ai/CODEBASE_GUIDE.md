@@ -9,7 +9,7 @@
 | I3 | Значения game filter в командной строке — только `[0-9,-]` | `zapretfmt.ValidatePortRanges` | `FuzzParseGameFilter` |
 | I4 | Служба zapret не остаётся со сломанным binPath | `applyStrategy` → `rollbackZapret` (прежняя строка, а если службы не было — удаление), `selectStrategy` (defer: после успешной установки winws службы не трогает; поднимает службу, только если она работала — `wasRunning`) | `TestWasRunning`, ручной сценарий; см. TESTING_GUIDE |
 | I5 | У службы zapret нет recovery actions | `installZapretService` → `ResetRecoveryActions` | ревью |
-| I6 | Корневая папка: писать могут только SYSTEM и администраторы, владелец — администраторы | `secureTree`, `ensureRootSecure`, `install` | `TestSecureTreeLocksOutNonAdmins` |
+| I6 | Корневая папка: писать могут только SYSTEM и администраторы, владелец — администраторы | `secureTree` (права меняются по дескриптору, открытому без перехода по ссылке; объект вне корня — отказ), `ensureRootSecure` (корень и ключевые файлы: exe, config.json, bin\winws.exe — `rootACLProblem`), `rootIsDedicated` (релиз в корне не делает чужие файлы своими), `install` | `TestSecureTreeLocksOutNonAdmins`, `TestSecureTreeDoesNotFollowJunction`, `TestRootACLProblemSeesCriticalChild`, `TestRootIsDedicatedWithRelease` |
 | I7 | Долгие операции под `.lock`, RMW state.json под `.state.lock` | `withLock`, `updateState` | `TestUpdateStateConcurrent`, `TestFileLockExcludesOtherHolders` |
 | I8 | `hostsfile.Merge` идемпотентен, блок один и в конце, чужие строки целы | `internal/hostsfile` | `FuzzMerge`, `TestMerge*` |
 | I9 | Перед записью hosts — копия в backups\ (без копии не пишем) | `writeHosts` | ревью |

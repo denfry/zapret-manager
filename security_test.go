@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -118,5 +119,118 @@ func TestACLReportString(t *testing.T) {
 	r := aclReport{Writers: []string{`NT AUTHORITY\Authenticated Users`}, Owner: `PC\user`}
 	if r.ok() || r.String() != `запись разрешена: NT AUTHORITY\Authenticated Users; владелец PC\user` {
 		t.Fatal(r.String())
+	}
+}
+
+// Ссылка (junction) внутри папки на чужую папку: права цели не меняются.
+func TestSecureTreeDoesNotFollowJunction(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "zapret")
+	outside := filepath.Join(base, "outside")
+	for _, d := range []string{root, outside} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(outside, "victim.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sd, _ := windows.SecurityDescriptorFromString("D:(A;;FA;;;WD)")
+	everyone, _, _ := sd.DACL()
+	victim := filepath.Join(outside, "victim.txt")
+	if err := windows.SetNamedSecurityInfo(victim, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, everyone, nil); err != nil {
+		t.Fatal(err)
+	}
+	cmdExe, err := systemBinary("cmd.exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := runHidden(cmdExe, "/c", "mklink", "/J", filepath.Join(root, "link"), outside); err != nil {
+		t.Skipf("junction не создать: %v %s", err, out)
+	}
+	t.Cleanup(func() { restoreUserAccess(t, root) })
+	_ = secureTree(root, isElevated()) // ошибка «ссылка пропущена» ожидаема
+	rep, err := checkDirACL(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Writers) == 0 {
+		t.Fatal("secureTree прошёл по ссылке и сбросил права на файл вне папки")
+	}
+	// Гонка: папку подменили ссылкой уже после обхода — путь ведёт через junction.
+	rootFinal, err := finalPathOf(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = resetChildSecurity(filepath.Join(root, "link", "victim.txt"), rootFinal, windows.READ_CONTROL|windows.WRITE_DAC,
+		windows.DACL_SECURITY_INFORMATION, nil, nil)
+	if !errors.Is(err, errOutsideRoot) {
+		t.Fatalf("объект за ссылкой должен отвергаться, получено %v", err)
+	}
+}
+
+func TestRootIsDedicatedWithRelease(t *testing.T) {
+	root := t.TempDir()
+	makeFakeRelease(t, root)
+	if ok, foreign, err := rootIsDedicated(root); err != nil || !ok {
+		t.Fatalf("распакованный релиз в корне подходит: %v %v %v", ok, foreign, err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "photo.jpg"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if ok, foreign, _ := rootIsDedicated(root); ok || len(foreign) != 1 {
+		t.Fatalf("релиз не делает чужие файлы своими: %v %v", ok, foreign)
+	}
+}
+
+// makeFakeRelease кладёт в dir минимальный релиз, который принимает validRelease.
+func makeFakeRelease(t *testing.T, dir string) {
+	t.Helper()
+	files := map[string]string{
+		`bin\winws.exe`: "x", `bin\WinDivert.dll`: "x", `bin\WinDivert64.sys`: "x",
+		"service.bat": "@echo off\r\n", "README.md": "readme", "LICENSE.txt": "mit",
+		"general.bat":            `start "" "%~dp0bin\winws.exe" --wf-tcp=80` + "\r\n",
+		`lists\list-general.txt`: "discord.com\r\n",
+	}
+	for name, content := range files {
+		p := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !validRelease(dir) {
+		t.Fatal("заготовка релиза не принята validRelease")
+	}
+}
+
+// Корень закрыт, но на exe службы кто-то дал себе запись — это тоже непорядок.
+func TestRootACLProblemSeesCriticalChild(t *testing.T) {
+	a := testApp(t)
+	a.Root = filepath.Join(a.Root, "zapret")
+	exe := a.path("zapret-manager.exe")
+	if err := os.MkdirAll(a.Root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { restoreUserAccess(t, a.Root) })
+	if err := secureTree(a.Root, isElevated()); err != nil {
+		t.Fatal(err)
+	}
+	// без прав администратора владельцем остаётся пользователь — смотрим только на запись
+	if rep, err := a.rootACLProblem(); err != nil || len(rep.Writers) != 0 {
+		t.Fatalf("после secureTree всё в порядке: %+v %v", rep, err)
+	}
+	sd, _ := windows.SecurityDescriptorFromString("D:(A;;FA;;;WD)")
+	everyone, _, _ := sd.DACL()
+	if err := windows.SetNamedSecurityInfo(exe, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, everyone, nil); err != nil {
+		t.Skipf("не изменить DACL exe: %v", err)
+	}
+	if rep, err := a.rootACLProblem(); err != nil || len(rep.Writers) == 0 {
+		t.Fatalf("явный ACE на exe не замечен: %+v %v", rep, err)
 	}
 }
