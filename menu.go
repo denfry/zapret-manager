@@ -378,7 +378,7 @@ func actSites(m *menu) bool {
 	s := m.view.Sites
 	m.say("Что разблокирует zapret сейчас:\n")
 	for _, l := range s.lines() {
-		m.say("  " + l)
+		m.say("  %s", l)
 	}
 	m.say("")
 	m.say("  1. Сервисы: включить или выключить (Instagram, X, Roblox…)")
@@ -444,7 +444,7 @@ func actSitesServices(m *menu) bool {
 		if svc.Note != "" {
 			line += " — " + svc.Note
 		}
-		m.say(line)
+		m.say("%s", line)
 	}
 	answer, ok := m.ask("\nНомера сервисов через пробел — включить выключенные и выключить включённые (Enter — назад): ")
 	if !ok || answer == "" {
@@ -679,7 +679,11 @@ func (m *menu) execCommand(name string, args []string) int {
 }
 
 func (m *menu) say(format string, args ...any) {
-	_, _ = fmt.Fprintf(m.out, format+"\n", args...) // вывод в консоль: ошибку записи некуда сообщить
+	// format передаётся в Fprintf как есть — так go vet видит say как printf-обёртку и
+	// ругается на непостоянный формат (строка с доменом из файла и «%» в ней).
+	// Вывод в консоль: ошибку записи некуда сообщить.
+	_, _ = fmt.Fprintf(m.out, format, args...)
+	_, _ = fmt.Fprintln(m.out)
 }
 
 // ask показывает вопрос и читает ответ; false — ввод закончился (окно закрывают, EOF).
