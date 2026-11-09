@@ -80,17 +80,17 @@ func TestValidateIpset(t *testing.T) {
 	for range 1500 {
 		lines = append(lines, "10.0.0.0/24")
 	}
-	if err := ValidateIpset(lines); err != nil {
+	if out, err := ValidateIpset(lines); err != nil || len(out) != len(lines) {
 		t.Fatal(err)
 	}
-	if err := ValidateIpset([]string{"<html>"}); err == nil {
+	if _, err := ValidateIpset([]string{"<html>"}); err == nil {
 		t.Fatal("мусор должен отвергаться")
 	}
 	mostlyGarbage := append(append([]string{}, lines[:1000]...), make([]string, 0)...)
 	for range 100 {
 		mostlyGarbage = append(mostlyGarbage, "<p>error</p>")
 	}
-	if err := ValidateIpset(mostlyGarbage); err == nil {
+	if _, err := ValidateIpset(mostlyGarbage); err == nil {
 		t.Fatal("больше 5% мусора должно отвергаться")
 	}
 }
@@ -149,5 +149,45 @@ func TestGameFilterFileContent(t *testing.T) {
 	bad := GameFilter{Mode: "all --x", TCPRange: "1 & calc", UDPRange: ""}
 	if got := bad.FileContent(); got != "mode=disabled\r\ntcp=1024-65535\r\nudp=1024-65535\r\n" {
 		t.Fatalf("%q", got)
+	}
+}
+
+// Немного мусора допускается, но в файл он не попадает.
+func TestValidateIpsetDropsGarbage(t *testing.T) {
+	lines := []string{"# comment"}
+	for range 1500 {
+		lines = append(lines, "10.0.0.0/24")
+	}
+	lines = append(lines, "<p>oops</p>", "--evil")
+	out, err := ValidateIpset(lines)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1501 || out[0] != "# comment" {
+		t.Fatalf("строк %d, первая %q", len(out), out[0])
+	}
+	for _, l := range out {
+		if l == "<p>oops</p>" || l == "--evil" {
+			t.Fatalf("мусор попал в результат: %q", l)
+		}
+	}
+}
+
+func TestGameFilterEmptyValueKeepsMode(t *testing.T) {
+	if gf := ParseGameFilter("mode=all\ntcp=\nudp=\n"); gf.Mode != ModeAll {
+		t.Fatalf("«tcp=» без значения сменил режим: %q", gf.Mode)
+	}
+	if gf := ParseGameFilter("tcp\n"); gf.Mode != ModeTCP {
+		t.Fatalf("старый формат «tcp»: %q", gf.Mode)
+	}
+}
+
+func TestIpsetModeMarkerInsideRealList(t *testing.T) {
+	list := []byte("1.1.1.0/24\r\n" + IpsetNoneMarker + "\r\n2.2.2.0/24\r\n")
+	if m := IpsetModeOf(list); m != IpsetLoaded {
+		t.Fatalf("список с заглушкой среди подсетей: %q", m)
+	}
+	if m := IpsetModeOf([]byte("# c\r\n" + IpsetNoneMarker + "\r\n")); m != IpsetNone {
+		t.Fatalf("одна заглушка: %q", m)
 	}
 }

@@ -85,3 +85,31 @@ func FuzzCompare(f *testing.F) {
 		}
 	})
 }
+
+func TestVersionEdgeCases(t *testing.T) {
+	for _, v := range []string{"1.", "1..", "1.2.3..", "1-", "1.2..3"} {
+		if Valid(v) {
+			t.Errorf("Valid(%q) = true", v)
+		}
+	}
+	for _, v := range []string{"1", "1.10.4", "1.10.5b", "1.10.4-20261109-120000"} {
+		if !Valid(v) {
+			t.Errorf("Valid(%q) = false", v)
+		}
+	}
+	if got := FromDirName("zapret-1.10.4-20261109-120000"); got != "1.10.4" {
+		t.Errorf("FromDirName с отметкой времени: %q", got)
+	}
+	if got := FromDirName("1.10.4-20261109-120000"); got != "1.10.4" {
+		t.Errorf("FromDirName папки перекачки: %q", got)
+	}
+	if Compare("1.10", "1.10.0") != 0 || Compare("1.10.0.0", "1.10") != 0 {
+		t.Error("хвост из нулей не меняет версию")
+	}
+	if Compare("1.10", "1.10.1") != -1 || Compare("1.10.0b", "1.10") != 1 {
+		t.Error("ненулевой хвост — новее")
+	}
+	if _, ok := FromServiceBat([]byte("set \"LOCAL_VERSION=1..\"\r\n")); ok {
+		t.Error("LOCAL_VERSION без проверки")
+	}
+}

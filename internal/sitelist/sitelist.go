@@ -31,6 +31,7 @@ import (
 	"net"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 
 	"zapret-manager/internal/textutil"
@@ -298,7 +299,10 @@ func NormalizeDomain(s string) (string, error) {
 		if i := strings.IndexAny(host, "/?#"); i >= 0 {
 			host = host[:i]
 		}
-		if h, _, err := net.SplitHostPort(host); err == nil {
+		if h, port, err := net.SplitHostPort(host); err == nil {
+			if n, perr := strconv.Atoi(port); perr != nil || n < 1 || n > 65535 {
+				return "", fmt.Errorf("%q: неверный порт %q", in, port)
+			}
 			host = h
 		}
 	}

@@ -57,9 +57,12 @@ func ParseGameFilter(content string) GameFilter {
 		if line == "" {
 			continue
 		}
-		k, v, _ := strings.Cut(line, "=")
+		k, v, hasValue := strings.Cut(line, "=")
 		k = strings.ToLower(strings.TrimSpace(k))
 		v = strings.TrimSpace(v)
+		if hasValue && v == "" {
+			continue // «tcp=» без значения — не старое однословное «tcp»
+		}
 		switch k {
 		case "mode":
 			gf.Mode = strings.ToLower(v)
@@ -189,10 +192,21 @@ func IpsetModeOf(content []byte) string {
 	if text == "" {
 		return IpsetAny
 	}
-	if strings.Contains(text, IpsetNoneMarker) {
+	// none — только если заглушка единственная запись: настоящий список, где среди
+	// тысяч подсетей случайно есть 203.0.113.113/32, — это loaded
+	marker := false
+	for l := range strings.SplitSeq(text, "\n") {
+		switch t := strings.TrimSpace(l); {
+		case t == IpsetNoneMarker:
+			marker = true
+		case t != "" && !strings.HasPrefix(t, "#"):
+			return IpsetLoaded
+		}
+	}
+	if marker {
 		return IpsetNone
 	}
-	return IpsetLoaded
+	return IpsetLoaded // одни комментарии — для service.bat это тоже loaded
 }
 
 // CountEntries counts non-empty, non-comment lines.
@@ -211,25 +225,32 @@ func CountEntries(content []byte) int {
 const MinIpsetEntries = 1000
 
 // ValidateIpset accepts a downloaded ipset when it has at least
-// MinIpsetEntries entries and ≥95% of them are IPs or CIDRs.
-func ValidateIpset(lines []string) error {
+// MinIpsetEntries entries and ≥95% of them are IPs or CIDRs. It returns the
+// lines to write: comments and valid entries only — the few tolerated bad
+// lines are dropped, not passed on to winws.
+func ValidateIpset(lines []string) ([]string, error) {
 	total, good := 0, 0
+	out := make([]string, 0, len(lines))
 	for _, l := range lines {
 		if l == "" || strings.HasPrefix(l, "#") {
+			if l != "" {
+				out = append(out, l)
+			}
 			continue
 		}
 		total++
 		if isIPOrCIDR(l) {
 			good++
+			out = append(out, l)
 		}
 	}
 	if total < MinIpsetEntries {
-		return fmt.Errorf("в ipset всего %d строк — похоже на ошибку", total)
+		return nil, fmt.Errorf("в ipset всего %d строк — похоже на ошибку", total)
 	}
 	if good*100 < total*95 {
-		return fmt.Errorf("в ipset %d из %d строк не похожи на IP/подсеть", total-good, total)
+		return nil, fmt.Errorf("в ipset %d из %d строк не похожи на IP/подсеть", total-good, total)
 	}
-	return nil
+	return out, nil
 }
 
 var domainLineRe = regexp.MustCompile(`^\^?[A-Za-z0-9*_.\-]+$`)

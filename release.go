@@ -456,8 +456,8 @@ func (a *App) updateIpset(ctx context.Context, relDir string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	lines := textutil.CleanLines(data)
-	if err := zapretfmt.ValidateIpset(lines); err != nil {
+	lines, err := zapretfmt.ValidateIpset(textutil.CleanLines(data))
+	if err != nil {
 		return false, err
 	}
 	target := filepath.Join(relDir, "lists", "ipset-all.txt")

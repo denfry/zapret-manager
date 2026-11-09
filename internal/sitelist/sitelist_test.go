@@ -199,3 +199,14 @@ func TestMarkerSubstringIsUserLine(t *testing.T) {
 		t.Fatalf("%q", out)
 	}
 }
+
+func TestNormalizeDomainPort(t *testing.T) {
+	if d, err := NormalizeDomain("example.com:8443"); err != nil || d != "example.com" {
+		t.Fatalf("порт: %q %v", d, err)
+	}
+	for _, in := range []string{"example.com:abc", "example.com:0", "example.com:70000"} {
+		if _, err := NormalizeDomain(in); err == nil {
+			t.Errorf("%q: неверный порт принят", in)
+		}
+	}
+}

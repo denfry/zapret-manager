@@ -8,15 +8,17 @@ import (
 )
 
 var (
-	validRe      = regexp.MustCompile(`^[0-9][0-9A-Za-z.\-]{0,30}$`)
+	validRe      = regexp.MustCompile(`^[0-9]([0-9A-Za-z.\-]{0,29}[0-9A-Za-z])?$`)
+	stampRe      = regexp.MustCompile(`-\d{8}-\d{6}$`)
 	tokenRe      = regexp.MustCompile(`\d+|[A-Za-z]+`)
 	localVersion = regexp.MustCompile(`(?im)^\s*set\s+"LOCAL_VERSION=([^"]+)"`)
 )
 
 // Valid reports whether v looks like a release version. Valid versions are
 // also safe to use as a single path component: no separators, no drive
-// letters, at most 31 characters.
-func Valid(v string) bool { return validRe.MatchString(v) }
+// letters, at most 31 characters, no ".." and no trailing dot or dash (Windows
+// drops a trailing dot, so "1." and "1" would be the same folder).
+func Valid(v string) bool { return validRe.MatchString(v) && !strings.Contains(v, "..") }
 
 // FromServiceBat extracts LOCAL_VERSION from the content of service.bat.
 func FromServiceBat(content []byte) (string, bool) {
@@ -25,13 +27,18 @@ func FromServiceBat(content []byte) (string, bool) {
 		return "", false
 	}
 	v := strings.TrimSpace(string(m[1]))
-	return v, v != ""
+	return v, Valid(v)
 }
 
 // FromDirName guesses the version from a release folder name such as
 // "zapret-discord-youtube-1.10.4". It returns the name itself when there is
-// no version suffix.
+// no version suffix. The "-YYYYMMDD-HHMMSS" suffix that a re-download adds
+// ("1.10.4-20261109-120000") is not part of the version.
 func FromDirName(base string) string {
+	base = stampRe.ReplaceAllString(base, "")
+	if Valid(base) {
+		return base
+	}
 	if i := strings.LastIndex(base, "-"); i >= 0 && Valid(base[i+1:]) {
 		return base[i+1:]
 	}
@@ -62,13 +69,23 @@ func Compare(a, b string) int {
 			}
 		}
 	}
+	// 1.10 и 1.10.0 — одна версия: хвост из одних нулей не делает версию новее
 	switch {
-	case len(ta) < len(tb):
+	case len(ta) < len(tb) && !allZeros(tb[len(ta):]):
 		return -1
-	case len(ta) > len(tb):
+	case len(ta) > len(tb) && !allZeros(ta[len(tb):]):
 		return 1
 	}
 	return 0
+}
+
+func allZeros(tokens []string) bool {
+	for _, t := range tokens {
+		if !isDigits(t) || strings.TrimLeft(t, "0") != "" {
+			return false
+		}
+	}
+	return true
 }
 
 func isDigits(s string) bool {
